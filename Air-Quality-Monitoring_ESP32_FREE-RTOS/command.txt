@@ -1,0 +1,4 @@
+To reset the cpu : 5a a5 07 82 00 04 55 aa 5a a5
+
+82 for Write data
+83 for Read data
