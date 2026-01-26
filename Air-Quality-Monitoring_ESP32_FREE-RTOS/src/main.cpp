@@ -14,13 +14,6 @@
 /* -------------------- GLOBALS -------------------- */
 SemaphoreHandle_t dwinUartMutex;
 
-/* -------------------- DWIN SEND VP -------------------- */
-/*
- * vp     : VP address (2 bytes)
- * data   : pointer to binary payload
- * length : payload length (1–240 bytes)
- */
-
 /* -------------------- VP DATA TYPE -------------------- */
 typedef enum {
   VP_TYPE_INT,
@@ -38,8 +31,15 @@ vp_type_t getVpType(uint16_t vp) {
     case 0x5042:
       return VP_TYPE_STRING;
 
+    // Settings VPs (INT)
+    case 0x5110:  // Temp unit
+    case 0x5111:  // Temp enable
+    case 0x5120:  // Pressure unit
+    case 0x5121:  // Pressure enable
+    case 0x5131:  // Humidity enable
+    case 0x5141:  // AQI enable
+
     // Examples from original code
-    case 0x5121:   // integer example
       return VP_TYPE_INT;
 
     case 0x5115:   // string example
@@ -152,7 +152,7 @@ const WidgetVPs widgets[4] = {
  * - param: ParameterType (icon)
  * - unit: UnitType
  * - data: ASCII string (up to 4 chars) or NULL to clear data
- * - alarm: Alarm state (default 1 = normal/no border; discuss later for other values like blink)
+ * - alarm: Alarm state (default 1 = normal/no border)
  *
  * Always sends 4 bytes for data: ASCII chars padded with 0xFF, or all 0xFF if clearing.
  */
@@ -185,37 +185,121 @@ void clearWidget(uint8_t index) {
   setWidget(index, PARAM_BLANK, UNIT_BLANK, NULL, 1);
 }
 
-/* -------------------- FREERTOS TASK -------------------- */
-void dwinTxTask(void *pvParameters) {
+/* -------------------- STATE VARIABLES -------------------- */
+bool tempEnabled = false;
+bool pressureEnabled = false;
+bool humidityEnabled = false;
+bool aqiEnabled = false;
+
+UnitType tempUnit = UNIT_F;      // Default °F
+UnitType pressureUnit = UNIT_MMH2O;  // Default mm H₂O
+
+// Track current dashboard assignments for data refresh
+ParameterType shownInWidget[4] = {PARAM_BLANK, PARAM_BLANK, PARAM_BLANK, PARAM_BLANK};
+
+/* -------------------- DASHBOARD REFRESH -------------------- */
+void refreshDashboard() {
+  // Collect enabled parameters in fixed order: Temp > Pressure > Humidity > AQI
+  ParameterType enabledParams[4];
+  uint8_t count = 0;
+
+  if (tempEnabled) enabledParams[count++] = PARAM_TEMPERATURE;
+  if (pressureEnabled) enabledParams[count++] = PARAM_PRESSURE;
+  if (humidityEnabled) enabledParams[count++] = PARAM_HUMIDITY;
+  if (aqiEnabled) enabledParams[count++] = PARAM_AQI;
+
+  // Assign to widgets from top, clear extras
+  for (uint8_t i = 0; i < 4; i++) {
+    if (i < count) {
+      ParameterType param = enabledParams[i];
+      UnitType unit;
+
+      switch (param) {
+        case PARAM_TEMPERATURE:
+          unit = tempUnit;
+          break;
+        case PARAM_PRESSURE:
+          unit = pressureUnit;
+          break;
+        case PARAM_HUMIDITY:
+          unit = UNIT_RH;  // Fixed
+          break;
+        case PARAM_AQI:
+          unit = UNIT_BLANK;  // Fixed
+          break;
+        default:
+          unit = UNIT_BLANK;
+      }
+
+      setWidget(i, param, unit, "123");  // Placeholder data
+      shownInWidget[i] = param;
+    } else {
+      clearWidget(i);
+      shownInWidget[i] = PARAM_BLANK;
+    }
+  }
+}
+
+/* -------------------- PERIODIC DATA REFRESH TASK -------------------- */
+void dwinDataRefreshTask(void *pvParameters) {
   while (1) {
-    // Example: Set 4 parameters (adapt to your sensor data)
-    // Widget A: Temperature 25 °C, normal alarm
-    setWidget(0, PARAM_TEMPERATURE, UNIT_C, "25");
-
-    // Widget B: Pressure 999 mmH2O, normal alarm
-    setWidget(1, PARAM_PRESSURE, UNIT_MMH2O, "999");
-
-    // Widget C: Humidity 50 %RH, normal alarm
-    setWidget(2, PARAM_HUMIDITY, UNIT_RH, "50");
-
-    // Widget D: AQI 100 (blank unit), normal alarm
-    setWidget(3, PARAM_AQI, UNIT_BLANK, "100");
-
-    vTaskDelay(pdMS_TO_TICKS(5000));  // Update every 5s
-
-    // Example: Show only 2 parameters, clear others
-    setWidget(0, PARAM_TEMPERATURE, UNIT_F, "77");
-    setWidget(1, PARAM_AQI, UNIT_BLANK, "150");
-    clearWidget(2);
-    clearWidget(3);
-
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // Refresh only data for active widgets (placeholder "123")
+    for (uint8_t i = 0; i < 4; i++) {
+      if (shownInWidget[i] != PARAM_BLANK) {
+        // Send "123" + 0xFF (4 bytes)
+        uint8_t dataBytes[4] = {'1', '2', '3', 0xFF};
+        dwinSendVP(widgets[i].dataVp, dataBytes, 4);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));  // Every 5 seconds
   }
 }
 
 /* ----------- Application handlers ----------- */
 void handleIntVP(uint16_t vp, uint16_t value) {
   Serial.printf("INT  VP 0x%04X = %d\n", vp, value);
+
+  switch (vp) {
+    // Temp unit: 0 = °F, 1 = °C
+    case 0x5110:
+      tempUnit = (value == 0) ? UNIT_F : UNIT_C;
+      refreshDashboard();
+      break;
+
+    // Temp enable: 0 = enabled, 1 = disabled
+    case 0x5111:
+      tempEnabled = (value == 0);
+      refreshDashboard();
+      break;
+
+    // Pressure unit: 0 = mm H₂O, 1 = Pa
+    case 0x5120:
+      pressureUnit = (value == 0) ? UNIT_MMH2O : UNIT_PA;
+      refreshDashboard();
+      break;
+
+    // Pressure enable
+    case 0x5121:
+      pressureEnabled = (value == 0);
+      refreshDashboard();
+      break;
+
+    // Humidity enable
+    case 0x5131:
+      humidityEnabled = (value == 0);
+      refreshDashboard();
+      break;
+
+    // AQI enable
+    case 0x5141:
+      aqiEnabled = (value == 0);
+      refreshDashboard();
+      break;
+
+    default:
+      // Other handlers if needed
+      break;
+  }
 }
 
 void handleStringVP(uint16_t vp, const char *text) {
@@ -310,10 +394,18 @@ void setup() {
     while (1);
   }
 
-  if (xTaskCreate(dwinTxTask, "DWIN_TX", 4096, NULL, 2, NULL) != pdPASS) {
-    Serial.println("Failed to create DWIN_TX task");
+  if (xTaskCreate(dwinDataRefreshTask, "DWIN_REFRESH", 4096, NULL, 2, NULL) != pdPASS) {
+    Serial.println("Failed to create DWIN_REFRESH task");
     while (1);
   }
+
+  // Read initial states from display
+  dwinReadVP(0x5110, 1);  // Temp unit
+  dwinReadVP(0x5111, 1);  // Temp enable
+  dwinReadVP(0x5120, 1);  // Pressure unit
+  dwinReadVP(0x5121, 1);  // Pressure enable
+  dwinReadVP(0x5131, 1);  // Humidity enable
+  dwinReadVP(0x5141, 1);  // AQI enable
 }
 
 /* -------------------- ARDUINO LOOP -------------------- */
