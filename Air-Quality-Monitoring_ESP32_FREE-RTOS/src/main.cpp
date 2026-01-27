@@ -1,7 +1,10 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "Adafruit_SHT31.h"
+#include "Adafruit_SGP40.h"
 
 /* -------------------- DWIN UART CONFIG -------------------- */
 #define DWIN_UART Serial2
@@ -14,6 +17,12 @@
 /* -------------------- GLOBALS -------------------- */
 SemaphoreHandle_t dwinUartMutex;
 
+/* -------------------- SENSORS -------------------- */
+Adafruit_SHT31 sht31;
+Adafruit_SGP40 sgp;
+bool sht31_ok = false;
+bool sgp_ok = false;
+
 /* -------------------- VP DATA TYPE -------------------- */
 typedef enum {
   VP_TYPE_INT,
@@ -21,7 +30,6 @@ typedef enum {
 } vp_type_t;
 
 /* -------------------- VP TYPE MAP -------------------- */
-/* Decide data type by VP address (recommended) */
 vp_type_t getVpType(uint16_t vp) {
   switch (vp) {
     // Data VPs (Text/ASCII)
@@ -38,18 +46,8 @@ vp_type_t getVpType(uint16_t vp) {
     case 0x5121:  // Pressure enable
     case 0x5131:  // Humidity enable
     case 0x5141:  // AQI enable
-
-    // Examples from original code
       return VP_TYPE_INT;
 
-    case 0x5115:   // string example
-    case 0x5135:   // string example
-    case 0x5145:   // string example
-    case 0x5125:   // string example
-    case 0x6050:   // string example
-      return VP_TYPE_STRING;
-
-    // All others (icons, units, alarms) default to INT
     default:
       return VP_TYPE_INT;
   }
@@ -61,14 +59,12 @@ void dwinSendVP(uint16_t vp, const uint8_t *data, uint8_t length) {
   }
 
   uint8_t frame[6 + length];
-
   frame[0] = 0x5A;
   frame[1] = 0xA5;
-  frame[2] = 3 + length;      // LEN = CMD + VP(2) + DATA
-  frame[3] = 0x82;            // Write VP
-  frame[4] = vp >> 8;         // VP high
-  frame[5] = vp & 0xFF;       // VP low
-
+  frame[2] = 3 + length;
+  frame[3] = 0x82;
+  frame[4] = vp >> 8;
+  frame[5] = vp & 0xFF;
   memcpy(&frame[6], data, length);
 
   if (xSemaphoreTake(dwinUartMutex, portMAX_DELAY) == pdTRUE) {
@@ -79,30 +75,18 @@ void dwinSendVP(uint16_t vp, const uint8_t *data, uint8_t length) {
 }
 
 /* -------------------- HELPER FUNCTIONS -------------------- */
-void dwinSendVP_u8(uint16_t vp, uint8_t value) {
-  dwinSendVP(vp, &value, 1);
-}
-
 void dwinSendVP_u16(uint16_t vp, uint16_t value) {
-  uint8_t data[2] = {
-    (uint8_t)(value >> 8),
-    (uint8_t)(value & 0xFF)
-  };
+  uint8_t data[2] = {(uint8_t)(value >> 8), (uint8_t)(value & 0xFF)};
   dwinSendVP(vp, data, 2);
-}
-
-void dwinSendVP_str(uint16_t vp, const char *text) {
-  if (text == NULL) return;
-  dwinSendVP(vp, (const uint8_t *)text, strlen(text));
 }
 
 /* -------------------- DWIN READ VP -------------------- */
 void dwinReadVP(uint16_t vp, uint8_t wordCount) {
-  if (wordCount == 0 || wordCount > 120) return;  // Limit per protocol
+  if (wordCount == 0 || wordCount > 120) return;
 
   uint8_t frame[7] = {
-    0x5A, 0xA5, 4,      // LEN = CMD + VP(2) + COUNT
-    0x83,               // Read VP
+    0x5A, 0xA5, 4,
+    0x83,
     vp >> 8, vp & 0xFF,
     wordCount
   };
@@ -140,23 +124,17 @@ struct WidgetVPs {
 };
 
 const WidgetVPs widgets[4] = {
-  {0x5010, 0x5011, 0x5012, 0x5019},  // Widget A (Top)
-  {0x5020, 0x5021, 0x5022, 0x5029},  // Widget B
-  {0x5030, 0x5031, 0x5032, 0x5039},  // Widget C
-  {0x5040, 0x5041, 0x5042, 0x5049}   // Widget D (Bottom)
+  {0x5010, 0x5011, 0x5012, 0x5019},  // A (Top)
+  {0x5020, 0x5021, 0x5022, 0x5029},  // B
+  {0x5030, 0x5031, 0x5032, 0x5039},  // C
+  {0x5040, 0x5041, 0x5042, 0x5049}   // D (Bottom)
 };
 
 /*
- * Set a widget on Page 8.
- * - index: 0 (A/Top) to 3 (D/Bottom)
- * - param: ParameterType (icon)
- * - unit: UnitType
- * - data: ASCII string (up to 4 chars) or NULL to clear data
- * - alarm: Alarm state (default 1 = normal/no border)
- *
- * Always sends 4 bytes for data: ASCII chars padded with 0xFF, or all 0xFF if clearing.
+ * Set a widget.
+ * data_str: data string (up to 4 chars), or NULL to fully clear data (all 0xFF)
  */
-void setWidget(uint8_t index, ParameterType param, UnitType unit, const char *data, uint16_t alarm = 1) {
+void setWidget(uint8_t index, ParameterType param, UnitType unit, const char *data_str = "NaN", uint16_t alarm = 1) {
   if (index >= 4) return;
 
   const WidgetVPs &w = widgets[index];
@@ -164,25 +142,19 @@ void setWidget(uint8_t index, ParameterType param, UnitType unit, const char *da
   dwinSendVP_u16(w.typeVp, param);
   dwinSendVP_u16(w.unitVp, unit);
 
-  // Prepare data: always 4 bytes, pad with 0xFF
   uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
-  if (data != NULL) {
-    size_t len = strlen(data);
+  if (data_str != NULL) {
+    size_t len = strlen(data_str);
     if (len > 4) len = 4;
-    memcpy(dataBytes, data, len);
-    // Remaining bytes stay 0xFF
+    memcpy(dataBytes, data_str, len);
   }
   dwinSendVP(w.dataVp, dataBytes, 4);
 
   dwinSendVP_u16(w.alarmVp, alarm);
 }
 
-/*
- * Clear (hide) a widget fully.
- * Equivalent to setWidget(index, PARAM_BLANK, UNIT_BLANK, NULL, 1)
- */
 void clearWidget(uint8_t index) {
-  setWidget(index, PARAM_BLANK, UNIT_BLANK, NULL, 1);
+  setWidget(index, PARAM_BLANK, UNIT_BLANK, NULL, 1);  // NULL → all 0xFF
 }
 
 /* -------------------- STATE VARIABLES -------------------- */
@@ -191,15 +163,13 @@ bool pressureEnabled = false;
 bool humidityEnabled = false;
 bool aqiEnabled = false;
 
-UnitType tempUnit = UNIT_F;      // Default °F
-UnitType pressureUnit = UNIT_MMH2O;  // Default mm H₂O
+UnitType tempUnit = UNIT_F;         // Default °F
+UnitType pressureUnit = UNIT_MMH2O; // Default mm H₂O
 
-// Track current dashboard assignments for data refresh
 ParameterType shownInWidget[4] = {PARAM_BLANK, PARAM_BLANK, PARAM_BLANK, PARAM_BLANK};
 
 /* -------------------- DASHBOARD REFRESH -------------------- */
 void refreshDashboard() {
-  // Collect enabled parameters in fixed order: Temp > Pressure > Humidity > AQI
   ParameterType enabledParams[4];
   uint8_t count = 0;
 
@@ -208,30 +178,20 @@ void refreshDashboard() {
   if (humidityEnabled) enabledParams[count++] = PARAM_HUMIDITY;
   if (aqiEnabled) enabledParams[count++] = PARAM_AQI;
 
-  // Assign to widgets from top, clear extras
   for (uint8_t i = 0; i < 4; i++) {
     if (i < count) {
       ParameterType param = enabledParams[i];
       UnitType unit;
 
       switch (param) {
-        case PARAM_TEMPERATURE:
-          unit = tempUnit;
-          break;
-        case PARAM_PRESSURE:
-          unit = pressureUnit;
-          break;
-        case PARAM_HUMIDITY:
-          unit = UNIT_RH;  // Fixed
-          break;
-        case PARAM_AQI:
-          unit = UNIT_BLANK;  // Fixed
-          break;
-        default:
-          unit = UNIT_BLANK;
+        case PARAM_TEMPERATURE: unit = tempUnit; break;
+        case PARAM_PRESSURE:    unit = pressureUnit; break;
+        case PARAM_HUMIDITY:    unit = UNIT_RH; break;
+        case PARAM_AQI:         unit = UNIT_BLANK; break;
+        default:                unit = UNIT_BLANK;
       }
 
-      setWidget(i, param, unit, "123");  // Placeholder data
+      setWidget(i, param, unit, "NaN");  // Initial "NaN" until refresh
       shownInWidget[i] = param;
     } else {
       clearWidget(i);
@@ -240,18 +200,65 @@ void refreshDashboard() {
   }
 }
 
-/* -------------------- PERIODIC DATA REFRESH TASK -------------------- */
+/* -------------------- SENSOR READING & DATA REFRESH TASK -------------------- */
 void dwinDataRefreshTask(void *pvParameters) {
   while (1) {
-    // Refresh only data for active widgets (placeholder "123")
-    for (uint8_t i = 0; i < 4; i++) {
-      if (shownInWidget[i] != PARAM_BLANK) {
-        // Send "123" + 0xFF (4 bytes)
-        uint8_t dataBytes[4] = {'1', '2', '3', 0xFF};
-        dwinSendVP(widgets[i].dataVp, dataBytes, 4);
+    // Default to NaN
+    String temp_str = "NaN";
+    String hum_str  = "NaN";
+    String aqi_str  = "NaN";
+    String pres_str = "NaN";  // No pressure sensor
+
+    float t = NAN, h = NAN;
+    bool valid_temp_hum = false;
+
+    if (sht31_ok) {
+      t = sht31.readTemperature();
+      h = sht31.readHumidity();
+      if (!isnan(t) && !isnan(h)) {
+        valid_temp_hum = true;
+
+        // Temperature (with unit conversion)
+        int temp_int = round(t);
+        if (tempUnit == UNIT_F) {
+          temp_int = round(t * 1.8f + 32.0f);
+        }
+        temp_str = String(temp_int);
+
+        // Humidity
+        hum_str = String((int)round(h));
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(5000));  // Every 5 seconds
+
+    // AQI (VOC Index) - only if temp/hum valid and SGP40 ok
+    if (valid_temp_hum && sgp_ok) {
+      int32_t voc = sgp.measureVocIndex(t, h);
+      aqi_str = String(voc);
+    }
+
+    // Send to active widgets
+    for (uint8_t i = 0; i < 4; i++) {
+      if (shownInWidget[i] == PARAM_BLANK) continue;
+
+      String data_str;
+      switch (shownInWidget[i]) {
+        case PARAM_TEMPERATURE: data_str = temp_str; break;
+        case PARAM_PRESSURE:    data_str = pres_str; break;
+        case PARAM_HUMIDITY:    data_str = hum_str;  break;
+        case PARAM_AQI:         data_str = aqi_str;  break;
+        default: continue;
+      }
+
+      uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+      size_t len = data_str.length();
+      if (len > 4) len = 4;
+      for (size_t j = 0; j < len; j++) {
+        dataBytes[j] = data_str.charAt(j);
+      }
+      dwinSendVP(widgets[i].dataVp, dataBytes, 4);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
 
@@ -259,46 +266,37 @@ void dwinDataRefreshTask(void *pvParameters) {
 void handleIntVP(uint16_t vp, uint16_t value) {
   Serial.printf("INT  VP 0x%04X = %d\n", vp, value);
 
+  bool changed = false;
+
   switch (vp) {
-    // Temp unit: 0 = °F, 1 = °C
-    case 0x5110:
+    case 0x5110:  // Temp unit
       tempUnit = (value == 0) ? UNIT_F : UNIT_C;
-      refreshDashboard();
+      changed = true;
       break;
-
-    // Temp enable: 0 = enabled, 1 = disabled
-    case 0x5111:
+    case 0x5111:  // Temp enable
       tempEnabled = (value == 0);
-      refreshDashboard();
+      changed = true;
       break;
-
-    // Pressure unit: 0 = mm H₂O, 1 = Pa
-    case 0x5120:
+    case 0x5120:  // Pressure unit
       pressureUnit = (value == 0) ? UNIT_MMH2O : UNIT_PA;
-      refreshDashboard();
+      changed = true;
       break;
-
-    // Pressure enable
-    case 0x5121:
+    case 0x5121:  // Pressure enable
       pressureEnabled = (value == 0);
-      refreshDashboard();
+      changed = true;
       break;
-
-    // Humidity enable
-    case 0x5131:
+    case 0x5131:  // Humidity enable
       humidityEnabled = (value == 0);
-      refreshDashboard();
+      changed = true;
       break;
-
-    // AQI enable
-    case 0x5141:
+    case 0x5141:  // AQI enable
       aqiEnabled = (value == 0);
-      refreshDashboard();
+      changed = true;
       break;
+  }
 
-    default:
-      // Other handlers if needed
-      break;
+  if (changed) {
+    refreshDashboard();
   }
 }
 
@@ -308,8 +306,7 @@ void handleStringVP(uint16_t vp, const char *text) {
 
 /* ----------- Frame Parser ----------- */
 void parseDwinFrame(uint8_t *frame, uint16_t len) {
-  if (len < 7) return;
-  if (frame[3] != 0x83) return;   // Not a read response
+  if (len < 7 || frame[3] != 0x83) return;
 
   uint16_t vp = (frame[4] << 8) | frame[5];
   uint8_t wordCount = frame[6];
@@ -317,23 +314,17 @@ void parseDwinFrame(uint8_t *frame, uint16_t len) {
 
   vp_type_t type = getVpType(vp);
 
-  if (type == VP_TYPE_INT) {
-    if (wordCount >= 1) {
-      uint16_t value = (data[0] << 8) | data[1];
-      handleIntVP(vp, value);
-    }
-  }
-  else if (type == VP_TYPE_STRING) {
-    char text[256];  // Increased size for safety
+  if (type == VP_TYPE_INT && wordCount >= 1) {
+    uint16_t value = (data[0] << 8) | data[1];
+    handleIntVP(vp, value);
+  } else if (type == VP_TYPE_STRING) {
+    char text[256] = {0};
     uint8_t maxBytes = wordCount * 2;
     uint8_t i = 0;
-
     while (i < maxBytes && i < sizeof(text) - 1 && data[i] != 0xFF) {
       text[i] = data[i];
       i++;
     }
-    text[i] = '\0';
-
     handleStringVP(vp, text);
   }
 }
@@ -348,16 +339,11 @@ void dwinRxTask(void *pvParameters) {
       uint8_t byteIn = DWIN_UART.read();
 
       if (index == 0 && byteIn != 0x5A) continue;
-      if (index == 1 && byteIn != 0xA5) {
-        index = 0;
-        continue;
-      }
+      if (index == 1 && byteIn != 0xA5) { index = 0; continue; }
 
       buffer[index++] = byteIn;
 
-      if (index == 3) {
-        expectedLen = buffer[2] + 3;
-      }
+      if (index == 3) expectedLen = buffer[2] + 3;
 
       if (expectedLen && index >= expectedLen) {
         parseDwinFrame(buffer, expectedLen);
@@ -373,15 +359,17 @@ void dwinRxTask(void *pvParameters) {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  Serial.println("ESP32 + FreeRTOS + DWIN + Sensors starting...");
 
-  Serial.println("ESP32 + FreeRTOS + DWIN DGUS starting...");
+  Wire.begin(21, 22);  // SDA, SCL
 
-  DWIN_UART.begin(
-    DWIN_BAUD,
-    SERIAL_8N1,
-    DWIN_RX_PIN,
-    DWIN_TX_PIN
-  );
+  sht31_ok = sht31.begin(0x44);
+  if (!sht31_ok) Serial.println("SHT31 not found");
+
+  sgp_ok = sgp.begin();
+  if (!sgp_ok) Serial.println("SGP40 not found");
+
+  DWIN_UART.begin(DWIN_BAUD, SERIAL_8N1, DWIN_RX_PIN, DWIN_TX_PIN);
 
   dwinUartMutex = xSemaphoreCreateMutex();
   if (dwinUartMutex == NULL) {
@@ -389,27 +377,19 @@ void setup() {
     while (1);
   }
 
-  if (xTaskCreate(dwinRxTask, "DWIN_RX", 4096, NULL, 2, NULL) != pdPASS) {
-    Serial.println("Failed to create DWIN_RX task");
-    while (1);
-  }
+  xTaskCreate(dwinRxTask, "DWIN_RX", 4096, NULL, 2, NULL);
+  xTaskCreate(dwinDataRefreshTask, "DWIN_REFRESH", 4096, NULL, 2, NULL);
 
-  if (xTaskCreate(dwinDataRefreshTask, "DWIN_REFRESH", 4096, NULL, 2, NULL) != pdPASS) {
-    Serial.println("Failed to create DWIN_REFRESH task");
-    while (1);
-  }
-
-  // Read initial states from display
-  dwinReadVP(0x5110, 1);  // Temp unit
-  dwinReadVP(0x5111, 1);  // Temp enable
-  dwinReadVP(0x5120, 1);  // Pressure unit
-  dwinReadVP(0x5121, 1);  // Pressure enable
-  dwinReadVP(0x5131, 1);  // Humidity enable
-  dwinReadVP(0x5141, 1);  // AQI enable
+  // Initial state sync
+  dwinReadVP(0x5110, 1);
+  dwinReadVP(0x5111, 1);
+  dwinReadVP(0x5120, 1);
+  dwinReadVP(0x5121, 1);
+  dwinReadVP(0x5131, 1);
+  dwinReadVP(0x5141, 1);
 }
 
 /* -------------------- ARDUINO LOOP -------------------- */
 void loop() {
-  // Not used — FreeRTOS scheduler is running
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
