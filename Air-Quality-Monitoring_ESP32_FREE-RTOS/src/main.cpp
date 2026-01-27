@@ -29,6 +29,51 @@ typedef enum {
   VP_TYPE_STRING
 } vp_type_t;
 
+/* -------------------- CALIBRATION & LIMITS STRUCTURE -------------------- */
+typedef struct {
+  int16_t offset;           // Calibration offset
+  int16_t upperLimit;       // Upper limit for alarm
+  int16_t lowerLimit;       // Lower limit for alarm
+  bool upperLimitSet;       // Is upper limit configured (not "-")
+  bool lowerLimitSet;       // Is lower limit configured (not "-")
+  bool alarmActive;         // Is alarm currently triggered
+  bool dataValid;           // Is sensor data valid (not NaN)
+} ParameterConfig;
+
+// Configuration for each parameter (with default values - limits not set)
+ParameterConfig tempConfig     = {0, 0, 0, false, false, false, false};
+ParameterConfig humidityConfig = {0, 0, 0, false, false, false, false};
+ParameterConfig pressureConfig = {0, 0, 0, false, false, false, false};
+ParameterConfig aqiConfig      = {0, 0, 0, false, false, false, false};
+
+// Current calibrated values (updated in data refresh task)
+int currentTempValue = 0;
+int currentHumidityValue = 0;
+int currentPressureValue = 0;
+int currentAqiValue = 0;
+
+// Alarm blink state (toggles every 500ms)
+bool alarmBlinkState = false;
+
+/* -------------------- VP ADDRESSES FOR CALIBRATION & LIMITS -------------------- */
+// Calibration Offset VPs (ASCII, 4 bytes)
+#define VP_TEMP_CALIBRATION     0x5215
+#define VP_HUMIDITY_CALIBRATION 0x5225
+#define VP_PRESSURE_CALIBRATION 0x5235
+#define VP_AQI_CALIBRATION      0x5245
+
+// Upper Limit VPs (ASCII, 4 bytes)
+#define VP_TEMP_UPPER_LIMIT     0x5112
+#define VP_HUMIDITY_UPPER_LIMIT 0x5122
+#define VP_PRESSURE_UPPER_LIMIT 0x5132
+#define VP_AQI_UPPER_LIMIT      0x5142
+
+// Lower Limit VPs (ASCII, 4 bytes)
+#define VP_TEMP_LOWER_LIMIT     0x5115
+#define VP_HUMIDITY_LOWER_LIMIT 0x5125
+#define VP_PRESSURE_LOWER_LIMIT 0x5135
+#define VP_AQI_LOWER_LIMIT      0x5145
+
 /* -------------------- VP TYPE MAP -------------------- */
 vp_type_t getVpType(uint16_t vp) {
   switch (vp) {
@@ -37,6 +82,21 @@ vp_type_t getVpType(uint16_t vp) {
     case 0x5022:
     case 0x5032:
     case 0x5042:
+    // Calibration VPs (Text/ASCII)
+    case VP_TEMP_CALIBRATION:
+    case VP_HUMIDITY_CALIBRATION:
+    case VP_PRESSURE_CALIBRATION:
+    case VP_AQI_CALIBRATION:
+    // Upper Limit VPs (Text/ASCII)
+    case VP_TEMP_UPPER_LIMIT:
+    case VP_HUMIDITY_UPPER_LIMIT:
+    case VP_PRESSURE_UPPER_LIMIT:
+    case VP_AQI_UPPER_LIMIT:
+    // Lower Limit VPs (Text/ASCII)
+    case VP_TEMP_LOWER_LIMIT:
+    case VP_HUMIDITY_LOWER_LIMIT:
+    case VP_PRESSURE_LOWER_LIMIT:
+    case VP_AQI_LOWER_LIMIT:
       return VP_TYPE_STRING;
 
     // Settings VPs (INT)
@@ -87,7 +147,7 @@ void dwinReadVP(uint16_t vp, uint8_t wordCount) {
   uint8_t frame[7] = {
     0x5A, 0xA5, 4,
     0x83,
-    vp >> 8, vp & 0xFF,
+    (uint8_t)(vp >> 8), (uint8_t)(vp & 0xFF),
     wordCount
   };
 
@@ -200,43 +260,179 @@ void refreshDashboard() {
   }
 }
 
+/* -------------------- CHECK IF STRING IS VALID NUMBER -------------------- */
+/*
+ * Returns true if the text represents a valid integer (including negative).
+ * Returns false if text is "-", empty, or non-numeric.
+ */
+bool isValidNumber(const char *text) {
+  if (text == NULL || text[0] == '\0') return false;
+  
+  // Skip leading spaces
+  while (*text == ' ') text++;
+  
+  if (*text == '\0') return false;
+  
+  // Check for just "-" (not a valid number)
+  if (text[0] == '-' && text[1] == '\0') return false;
+  
+  // Check if it's a valid integer format
+  const char *p = text;
+  
+  // Allow leading minus sign
+  if (*p == '-') p++;
+  
+  // Must have at least one digit
+  if (*p == '\0') return false;
+  
+  // Check all remaining characters are digits
+  while (*p != '\0') {
+    if (*p < '0' || *p > '9') return false;
+    p++;
+  }
+  
+  return true;
+}
+
+/* -------------------- PARSE ASCII STRING TO INTEGER -------------------- */
+int16_t parseAsciiToInt(const char *text) {
+  if (!isValidNumber(text)) return 0;
+  return (int16_t)atoi(text);
+}
+
+/* -------------------- CHECK ALARM CONDITION -------------------- */
+/*
+ * Returns true if alarm should be active.
+ * Alarm triggers only if:
+ *   - Data is valid (not NaN)
+ *   - At least one limit is set
+ *   - Value exceeds the set limit(s)
+ */
+bool checkAlarmCondition(int value, ParameterConfig *config) {
+  // No alarm if data is invalid
+  if (!config->dataValid) return false;
+  
+  // No alarm if no limits are set
+  if (!config->upperLimitSet && !config->lowerLimitSet) return false;
+  
+  // Check upper limit (only if set)
+  if (config->upperLimitSet && value > config->upperLimit) return true;
+  
+  // Check lower limit (only if set)
+  if (config->lowerLimitSet && value < config->lowerLimit) return true;
+  
+  return false;
+}
+
+/* -------------------- GET ALARM STATE FOR PARAMETER -------------------- */
+bool getAlarmStateForParam(ParameterType param) {
+  switch (param) {
+    case PARAM_TEMPERATURE: return tempConfig.alarmActive;
+    case PARAM_PRESSURE:    return pressureConfig.alarmActive;
+    case PARAM_HUMIDITY:    return humidityConfig.alarmActive;
+    case PARAM_AQI:         return aqiConfig.alarmActive;
+    default:                return false;
+  }
+}
+
+/* -------------------- ALARM BLINK TASK -------------------- */
+void alarmBlinkTask(void *pvParameters) {
+  while (1) {
+    // Toggle blink state
+    alarmBlinkState = !alarmBlinkState;
+    
+    // Check each active widget
+    for (uint8_t i = 0; i < 4; i++) {
+      ParameterType param = shownInWidget[i];
+      
+      if (param == PARAM_BLANK) {
+        // No parameter in this widget, ensure alarm is off
+        dwinSendVP_u16(widgets[i].alarmVp, 1);
+        continue;
+      }
+      
+      bool alarmActive = getAlarmStateForParam(param);
+      
+      if (alarmActive) {
+        // Alarm active - blink (0 = red line visible, 1 = no red line)
+        uint16_t alarmValue = alarmBlinkState ? 1 : 0;
+        dwinSendVP_u16(widgets[i].alarmVp, alarmValue);
+      } else {
+        // Alarm not active - ensure alarm is off (no red line)
+        dwinSendVP_u16(widgets[i].alarmVp, 1);
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(500));  // 500ms blink interval
+  }
+}
+
 /* -------------------- SENSOR READING & DATA REFRESH TASK -------------------- */
 void dwinDataRefreshTask(void *pvParameters) {
   while (1) {
-    // Default to NaN
+    // Default to NaN (invalid data)
     String temp_str = "NaN";
     String hum_str  = "NaN";
     String aqi_str  = "NaN";
     String pres_str = "NaN";  // No pressure sensor
 
+    // Reset data valid flags
+    tempConfig.dataValid = false;
+    humidityConfig.dataValid = false;
+    pressureConfig.dataValid = false;  // No sensor, always false
+    aqiConfig.dataValid = false;
+
     float t = NAN, h = NAN;
-    bool valid_temp_hum = false;
 
     if (sht31_ok) {
       t = sht31.readTemperature();
       h = sht31.readHumidity();
-      if (!isnan(t) && !isnan(h)) {
-        valid_temp_hum = true;
-
-        // Temperature (with unit conversion)
+      
+      // Temperature
+      if (!isnan(t)) {
+        // Unit conversion first, then apply offset
         int temp_int = round(t);
         if (tempUnit == UNIT_F) {
           temp_int = round(t * 1.8f + 32.0f);
         }
+        // Apply calibration offset after unit conversion
+        temp_int = temp_int + tempConfig.offset;
+        currentTempValue = temp_int;
         temp_str = String(temp_int);
+        tempConfig.dataValid = true;
+      }
 
-        // Humidity
-        hum_str = String((int)round(h));
+      // Humidity
+      if (!isnan(h)) {
+        int hum_int = (int)round(h);
+        hum_int = hum_int + humidityConfig.offset;
+        currentHumidityValue = hum_int;
+        hum_str = String(hum_int);
+        humidityConfig.dataValid = true;
       }
     }
 
     // AQI (VOC Index) - only if temp/hum valid and SGP40 ok
-    if (valid_temp_hum && sgp_ok) {
+    if (!isnan(t) && !isnan(h) && sgp_ok) {
       int32_t voc = sgp.measureVocIndex(t, h);
-      aqi_str = String(voc);
+      // Apply calibration offset
+      int aqi_int = voc + aqiConfig.offset;
+      currentAqiValue = aqi_int;
+      aqi_str = String(aqi_int);
+      aqiConfig.dataValid = true;
     }
 
-    // Send to active widgets
+    // Pressure - No sensor integrated, always NaN
+    // pressureConfig.dataValid remains false
+    // pres_str remains "NaN"
+
+    // Check alarms for each parameter
+    tempConfig.alarmActive = checkAlarmCondition(currentTempValue, &tempConfig);
+    humidityConfig.alarmActive = checkAlarmCondition(currentHumidityValue, &humidityConfig);
+    pressureConfig.alarmActive = checkAlarmCondition(currentPressureValue, &pressureConfig);
+    aqiConfig.alarmActive = checkAlarmCondition(currentAqiValue, &aqiConfig);
+
+    // Send data to active widgets
     for (uint8_t i = 0; i < 4; i++) {
       if (shownInWidget[i] == PARAM_BLANK) continue;
 
@@ -301,7 +497,97 @@ void handleIntVP(uint16_t vp, uint16_t value) {
 }
 
 void handleStringVP(uint16_t vp, const char *text) {
-  Serial.printf("STR  VP 0x%04X = %s\n", vp, text);
+  Serial.printf("STR  VP 0x%04X = \"%s\"\n", vp, text);
+
+  bool validNum = isValidNumber(text);
+  int16_t value = validNum ? parseAsciiToInt(text) : 0;
+
+  switch (vp) {
+    // -------- Calibration Offset VPs --------
+    case VP_TEMP_CALIBRATION:
+      tempConfig.offset = validNum ? value : 0;
+      Serial.printf("  -> Temp calibration offset: %d (valid: %s)\n", 
+                    tempConfig.offset, validNum ? "yes" : "no");
+      break;
+    case VP_HUMIDITY_CALIBRATION:
+      humidityConfig.offset = validNum ? value : 0;
+      Serial.printf("  -> Humidity calibration offset: %d (valid: %s)\n", 
+                    humidityConfig.offset, validNum ? "yes" : "no");
+      break;
+    case VP_PRESSURE_CALIBRATION:
+      pressureConfig.offset = validNum ? value : 0;
+      Serial.printf("  -> Pressure calibration offset: %d (valid: %s)\n", 
+                    pressureConfig.offset, validNum ? "yes" : "no");
+      break;
+    case VP_AQI_CALIBRATION:
+      aqiConfig.offset = validNum ? value : 0;
+      Serial.printf("  -> AQI calibration offset: %d (valid: %s)\n", 
+                    aqiConfig.offset, validNum ? "yes" : "no");
+      break;
+
+    // -------- Upper Limit VPs --------
+    case VP_TEMP_UPPER_LIMIT:
+      tempConfig.upperLimitSet = validNum;
+      tempConfig.upperLimit = validNum ? value : 0;
+      Serial.printf("  -> Temp upper limit: %d (set: %s)\n", 
+                    tempConfig.upperLimit, validNum ? "yes" : "no");
+      break;
+    case VP_HUMIDITY_UPPER_LIMIT:
+      humidityConfig.upperLimitSet = validNum;
+      humidityConfig.upperLimit = validNum ? value : 0;
+      Serial.printf("  -> Humidity upper limit: %d (set: %s)\n", 
+                    humidityConfig.upperLimit, validNum ? "yes" : "no");
+      break;
+    case VP_PRESSURE_UPPER_LIMIT:
+      pressureConfig.upperLimitSet = validNum;
+      pressureConfig.upperLimit = validNum ? value : 0;
+      Serial.printf("  -> Pressure upper limit: %d (set: %s)\n", 
+                    pressureConfig.upperLimit, validNum ? "yes" : "no");
+      break;
+    case VP_AQI_UPPER_LIMIT:
+      aqiConfig.upperLimitSet = validNum;
+      aqiConfig.upperLimit = validNum ? value : 0;
+      Serial.printf("  -> AQI upper limit: %d (set: %s)\n", 
+                    aqiConfig.upperLimit, validNum ? "yes" : "no");
+      break;
+
+    // -------- Lower Limit VPs --------
+    case VP_TEMP_LOWER_LIMIT:
+      tempConfig.lowerLimitSet = validNum;
+      tempConfig.lowerLimit = validNum ? value : 0;
+      Serial.printf("  -> Temp lower limit: %d (set: %s)\n", 
+                    tempConfig.lowerLimit, validNum ? "yes" : "no");
+      break;
+    case VP_HUMIDITY_LOWER_LIMIT:
+      humidityConfig.lowerLimitSet = validNum;
+      humidityConfig.lowerLimit = validNum ? value : 0;
+      Serial.printf("  -> Humidity lower limit: %d (set: %s)\n", 
+                    humidityConfig.lowerLimit, validNum ? "yes" : "no");
+      break;
+    case VP_PRESSURE_LOWER_LIMIT:
+      pressureConfig.lowerLimitSet = validNum;
+      pressureConfig.lowerLimit = validNum ? value : 0;
+      Serial.printf("  -> Pressure lower limit: %d (set: %s)\n", 
+                    pressureConfig.lowerLimit, validNum ? "yes" : "no");
+      break;
+    case VP_AQI_LOWER_LIMIT:
+      aqiConfig.lowerLimitSet = validNum;
+      aqiConfig.lowerLimit = validNum ? value : 0;
+      Serial.printf("  -> AQI lower limit: %d (set: %s)\n", 
+                    aqiConfig.lowerLimit, validNum ? "yes" : "no");
+      break;
+
+    // -------- Data Display VPs (logging only) --------
+    case 0x5012:
+    case 0x5022:
+    case 0x5032:
+    case 0x5042:
+      break;
+
+    default:
+      Serial.printf("  -> Unhandled string VP\n");
+      break;
+  }
 }
 
 /* ----------- Frame Parser ----------- */
@@ -321,10 +607,11 @@ void parseDwinFrame(uint8_t *frame, uint16_t len) {
     char text[256] = {0};
     uint8_t maxBytes = wordCount * 2;
     uint8_t i = 0;
-    while (i < maxBytes && i < sizeof(text) - 1 && data[i] != 0xFF) {
+    while (i < maxBytes && i < sizeof(text) - 1 && data[i] != 0xFF && data[i] != 0x00) {
       text[i] = data[i];
       i++;
     }
+    text[i] = '\0';
     handleStringVP(vp, text);
   }
 }
@@ -355,38 +642,97 @@ void dwinRxTask(void *pvParameters) {
   }
 }
 
+/* -------------------- READ CALIBRATION & LIMITS ON BOOT -------------------- */
+void readCalibrationAndLimitsFromDisplay() {
+  // Read Calibration Offsets (2 words = 4 bytes each)
+  dwinReadVP(VP_TEMP_CALIBRATION, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_HUMIDITY_CALIBRATION, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_PRESSURE_CALIBRATION, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_AQI_CALIBRATION, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+
+  // Read Upper Limits (2 words = 4 bytes each)
+  dwinReadVP(VP_TEMP_UPPER_LIMIT, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_HUMIDITY_UPPER_LIMIT, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_PRESSURE_UPPER_LIMIT, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_AQI_UPPER_LIMIT, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+
+  // Read Lower Limits (2 words = 4 bytes each)
+  dwinReadVP(VP_TEMP_LOWER_LIMIT, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_HUMIDITY_LOWER_LIMIT, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_PRESSURE_LOWER_LIMIT, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(VP_AQI_LOWER_LIMIT, 2);
+  vTaskDelay(pdMS_TO_TICKS(50));
+}
+
 /* -------------------- ARDUINO SETUP -------------------- */
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("ESP32 + FreeRTOS + DWIN + Sensors starting...");
+  Serial.println("===========================================");
+  Serial.println("ESP32 + FreeRTOS + DWIN + Sensors");
+  Serial.println("Stage 2: Calibration, Limits & Alarms");
+  Serial.println("Bug Fix: Default '-' handling & NaN for missing sensors");
+  Serial.println("===========================================");
 
   Wire.begin(21, 22);  // SDA, SCL
 
   sht31_ok = sht31.begin(0x44);
-  if (!sht31_ok) Serial.println("SHT31 not found");
+  if (!sht31_ok) Serial.println("[ERROR] SHT31 not found");
+  else Serial.println("[OK] SHT31 initialized");
 
   sgp_ok = sgp.begin();
-  if (!sgp_ok) Serial.println("SGP40 not found");
+  if (!sgp_ok) Serial.println("[ERROR] SGP40 not found");
+  else Serial.println("[OK] SGP40 initialized");
 
   DWIN_UART.begin(DWIN_BAUD, SERIAL_8N1, DWIN_RX_PIN, DWIN_TX_PIN);
+  Serial.println("[OK] DWIN UART initialized");
 
   dwinUartMutex = xSemaphoreCreateMutex();
   if (dwinUartMutex == NULL) {
-    Serial.println("Failed to create UART mutex");
+    Serial.println("[FATAL] Failed to create UART mutex");
     while (1);
   }
+  Serial.println("[OK] UART mutex created");
 
+  // Create FreeRTOS tasks
   xTaskCreate(dwinRxTask, "DWIN_RX", 4096, NULL, 2, NULL);
   xTaskCreate(dwinDataRefreshTask, "DWIN_REFRESH", 4096, NULL, 2, NULL);
+  xTaskCreate(alarmBlinkTask, "ALARM_BLINK", 2048, NULL, 1, NULL);
+  Serial.println("[OK] FreeRTOS tasks created");
 
-  // Initial state sync
-  dwinReadVP(0x5110, 1);
-  dwinReadVP(0x5111, 1);
-  dwinReadVP(0x5120, 1);
-  dwinReadVP(0x5121, 1);
-  dwinReadVP(0x5131, 1);
-  dwinReadVP(0x5141, 1);
+  // Initial state sync - Settings VPs
+  Serial.println("Reading settings VPs...");
+  dwinReadVP(0x5110, 1);  // Temp unit
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(0x5111, 1);  // Temp enable
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(0x5120, 1);  // Pressure unit
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(0x5121, 1);  // Pressure enable
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(0x5131, 1);  // Humidity enable
+  vTaskDelay(pdMS_TO_TICKS(50));
+  dwinReadVP(0x5141, 1);  // AQI enable
+  vTaskDelay(pdMS_TO_TICKS(50));
+
+  // Read calibration and limits from display
+  Serial.println("Reading calibration & limits VPs...");
+  readCalibrationAndLimitsFromDisplay();
+
+  Serial.println("===========================================");
+  Serial.println("Setup complete! System running.");
+  Serial.println("===========================================");
 }
 
 /* -------------------- ARDUINO LOOP -------------------- */
