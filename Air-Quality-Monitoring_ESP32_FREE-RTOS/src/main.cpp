@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -16,6 +17,9 @@
 
 /* -------------------- GLOBALS -------------------- */
 SemaphoreHandle_t dwinUartMutex;
+
+/* -------------------- EEPROM / PREFERENCES -------------------- */
+Preferences preferences;
 
 /* -------------------- SENSORS -------------------- */
 Adafruit_SHT31 sht31;
@@ -55,7 +59,19 @@ int currentAqiValue = 0;
 // Alarm blink state (toggles every 500ms)
 bool alarmBlinkState = false;
 
-/* -------------------- VP ADDRESSES FOR CALIBRATION & LIMITS -------------------- */
+/* -------------------- PASSWORD CONFIGURATION -------------------- */
+#define DEFAULT_SETTINGS_PASSWORD   "123456"
+#define ADVANCED_SETTINGS_PASSWORD  "124578"
+#define PASSWORD_LENGTH             6
+
+// Settings password (stored in EEPROM, changeable)
+char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
+
+// Page IDs
+#define PAGE_SETTINGS          0x01
+#define PAGE_ADVANCED_SETTINGS 0x0A
+
+/* -------------------- VP ADDRESSES -------------------- */
 // Calibration Offset VPs (ASCII, 4 bytes)
 #define VP_TEMP_CALIBRATION     0x5215
 #define VP_HUMIDITY_CALIBRATION 0x5225
@@ -73,6 +89,15 @@ bool alarmBlinkState = false;
 #define VP_HUMIDITY_LOWER_LIMIT 0x5125
 #define VP_PRESSURE_LOWER_LIMIT 0x5135
 #define VP_AQI_LOWER_LIMIT      0x5145
+
+// Buzzer register address
+#define DWIN_BUZZER_VP          0x00A0
+#define DWIN_BUZZER_ON          0x000F
+
+// Password VPs (ASCII, 6 bytes)
+#define VP_SETTINGS_PASSWORD_ENTRY    0x5350
+#define VP_SETTINGS_PASSWORD_CHANGE   0x5360
+#define VP_ADVANCED_PASSWORD_ENTRY    0x5370
 
 /* -------------------- VP TYPE MAP -------------------- */
 vp_type_t getVpType(uint16_t vp) {
@@ -97,6 +122,10 @@ vp_type_t getVpType(uint16_t vp) {
     case VP_HUMIDITY_LOWER_LIMIT:
     case VP_PRESSURE_LOWER_LIMIT:
     case VP_AQI_LOWER_LIMIT:
+    // Password VPs (Text/ASCII)
+    case VP_SETTINGS_PASSWORD_ENTRY:
+    case VP_SETTINGS_PASSWORD_CHANGE:
+    case VP_ADVANCED_PASSWORD_ENTRY:
       return VP_TYPE_STRING;
 
     // Settings VPs (INT)
@@ -140,6 +169,26 @@ void dwinSendVP_u16(uint16_t vp, uint16_t value) {
   dwinSendVP(vp, data, 2);
 }
 
+/* -------------------- DWIN SWITCH PAGE -------------------- */
+void dwinSwitchPage(uint8_t pageId) {
+  // Command format: 5A A5 07 82 00 84 5A 01 00 XX (XX = page ID)
+  uint8_t frame[10] = {
+    0x5A, 0xA5, 0x07,
+    0x82,
+    0x00, 0x84,
+    0x5A, 0x01,
+    0x00, pageId
+  };
+
+  if (xSemaphoreTake(dwinUartMutex, portMAX_DELAY) == pdTRUE) {
+    DWIN_UART.write(frame, sizeof(frame));
+    DWIN_UART.flush();
+    xSemaphoreGive(dwinUartMutex);
+  }
+
+  Serial.printf("[PAGE] Switched to page %d\n", pageId);
+}
+
 /* -------------------- DWIN READ VP -------------------- */
 void dwinReadVP(uint16_t vp, uint8_t wordCount) {
   if (wordCount == 0 || wordCount > 120) return;
@@ -156,6 +205,50 @@ void dwinReadVP(uint16_t vp, uint8_t wordCount) {
     DWIN_UART.flush();
     xSemaphoreGive(dwinUartMutex);
   }
+}
+
+/* -------------------- PASSWORD FUNCTIONS -------------------- */
+void loadPasswordFromEEPROM() {
+  preferences.begin("settings", true);  // Read-only mode
+  String storedPassword = preferences.getString("password", DEFAULT_SETTINGS_PASSWORD);
+  preferences.end();
+
+  // Copy to settingsPassword array
+  strncpy(settingsPassword, storedPassword.c_str(), PASSWORD_LENGTH);
+  settingsPassword[PASSWORD_LENGTH] = '\0';
+
+  Serial.printf("[EEPROM] Loaded settings password: %s\n", settingsPassword);
+}
+
+void savePasswordToEEPROM(const char *newPassword) {
+  preferences.begin("settings", false);  // Read-write mode
+  preferences.putString("password", newPassword);
+  preferences.end();
+
+  // Update local copy
+  strncpy(settingsPassword, newPassword, PASSWORD_LENGTH);
+  settingsPassword[PASSWORD_LENGTH] = '\0';
+
+  Serial.printf("[EEPROM] Saved new settings password: %s\n", settingsPassword);
+}
+
+bool validatePassword(const char *enteredPassword, const char *correctPassword) {
+  if (enteredPassword == NULL || correctPassword == NULL) return false;
+  return (strncmp(enteredPassword, correctPassword, PASSWORD_LENGTH) == 0);
+}
+
+bool isValidPasswordFormat(const char *password) {
+  if (password == NULL) return false;
+  
+  size_t len = strlen(password);
+  if (len != PASSWORD_LENGTH) return false;
+  
+  // Check all characters are digits
+  for (size_t i = 0; i < len; i++) {
+    if (password[i] < '0' || password[i] > '9') return false;
+  }
+  
+  return true;
 }
 
 /* -------------------- PAGE 8 WIDGET CONFIG -------------------- */
@@ -357,6 +450,7 @@ void alarmBlinkTask(void *pvParameters) {
         // Alarm active - blink (0 = red line visible, 1 = no red line)
         uint16_t alarmValue = alarmBlinkState ? 1 : 0;
         dwinSendVP_u16(widgets[i].alarmVp, alarmValue);
+        dwinSendVP_u16(DWIN_BUZZER_VP, DWIN_BUZZER_ON);
       } else {
         // Alarm not active - ensure alarm is off (no red line)
         dwinSendVP_u16(widgets[i].alarmVp, 1);
@@ -499,6 +593,43 @@ void handleIntVP(uint16_t vp, uint16_t value) {
 void handleStringVP(uint16_t vp, const char *text) {
   Serial.printf("STR  VP 0x%04X = \"%s\"\n", vp, text);
 
+  // Handle Password VPs first
+  switch (vp) {
+    // -------- Settings Password Entry --------
+    case VP_SETTINGS_PASSWORD_ENTRY:
+      Serial.printf("  -> Settings password attempt: %s\n", text);
+      if (validatePassword(text, settingsPassword)) {
+        Serial.println("  -> Password CORRECT! Switching to Settings page.");
+        dwinSwitchPage(PAGE_SETTINGS);
+      } else {
+        Serial.println("  -> Password INCORRECT!");
+      }
+      return;
+
+    // -------- Settings Password Change --------
+    case VP_SETTINGS_PASSWORD_CHANGE:
+      Serial.printf("  -> Settings password change request: %s\n", text);
+      if (isValidPasswordFormat(text)) {
+        savePasswordToEEPROM(text);
+        Serial.println("  -> New password saved successfully!");
+      } else {
+        Serial.println("  -> Invalid password format! Must be 6 digits.");
+      }
+      return;
+
+    // -------- Advanced Settings Password Entry --------
+    case VP_ADVANCED_PASSWORD_ENTRY:
+      Serial.printf("  -> Advanced settings password attempt: %s\n", text);
+      if (validatePassword(text, ADVANCED_SETTINGS_PASSWORD)) {
+        Serial.println("  -> Password CORRECT! Switching to Advanced Settings page.");
+        dwinSwitchPage(PAGE_ADVANCED_SETTINGS);
+      } else {
+        Serial.println("  -> Password INCORRECT!");
+      }
+      return;
+  }
+
+  // Handle other string VPs (calibration & limits)
   bool validNum = isValidNumber(text);
   int16_t value = validNum ? parseAsciiToInt(text) : 0;
 
@@ -681,9 +812,11 @@ void setup() {
   delay(500);
   Serial.println("===========================================");
   Serial.println("ESP32 + FreeRTOS + DWIN + Sensors");
-  Serial.println("Stage 2: Calibration, Limits & Alarms");
-  Serial.println("Bug Fix: Default '-' handling & NaN for missing sensors");
+  Serial.println("Stage 3: Password Protected Settings");
   Serial.println("===========================================");
+
+  // Load password from EEPROM
+  loadPasswordFromEEPROM();
 
   Wire.begin(21, 22);  // SDA, SCL
 
