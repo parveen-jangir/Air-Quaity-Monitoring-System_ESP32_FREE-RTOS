@@ -40,15 +40,16 @@ typedef struct {
   int16_t lowerLimit;       // Lower limit for alarm
   bool upperLimitSet;       // Is upper limit configured (not "-")
   bool lowerLimitSet;       // Is lower limit configured (not "-")
-  bool alarmActive;         // Is alarm currently triggered
+  bool alarmActive;         // Is alarm currently triggered (value out of limits)
+  bool alarmAcknowledged;   // Has alarm been acknowledged by user
   bool dataValid;           // Is sensor data valid (not NaN)
 } ParameterConfig;
 
 // Configuration for each parameter (with default values - limits not set)
-ParameterConfig tempConfig     = {0, 0, 0, false, false, false, false};
-ParameterConfig humidityConfig = {0, 0, 0, false, false, false, false};
-ParameterConfig pressureConfig = {0, 0, 0, false, false, false, false};
-ParameterConfig aqiConfig      = {0, 0, 0, false, false, false, false};
+ParameterConfig tempConfig     = {0, 0, 0, false, false, false, false, false};
+ParameterConfig humidityConfig = {0, 0, 0, false, false, false, false, false};
+ParameterConfig pressureConfig = {0, 0, 0, false, false, false, false, false};
+ParameterConfig aqiConfig      = {0, 0, 0, false, false, false, false, false};
 
 // Current calibrated values (updated in data refresh task)
 int currentTempValue = 0;
@@ -99,6 +100,9 @@ char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
 #define VP_SETTINGS_PASSWORD_CHANGE   0x5360
 #define VP_ADVANCED_PASSWORD_ENTRY    0x5370
 
+// Alarm Acknowledge VP
+#define VP_ALARM_ACK            0x5001
+
 /* -------------------- VP TYPE MAP -------------------- */
 vp_type_t getVpType(uint16_t vp) {
   switch (vp) {
@@ -135,6 +139,7 @@ vp_type_t getVpType(uint16_t vp) {
     case 0x5121:  // Pressure enable
     case 0x5131:  // Humidity enable
     case 0x5141:  // AQI enable
+    case VP_ALARM_ACK:  // Alarm acknowledge button
       return VP_TYPE_INT;
 
     default:
@@ -249,6 +254,45 @@ bool isValidPasswordFormat(const char *password) {
   }
   
   return true;
+}
+
+/* -------------------- ALARM ACKNOWLEDGE FUNCTION -------------------- */
+void acknowledgeAllAlarms() {
+  bool anyAlarmAcknowledged = false;
+
+  // Acknowledge temperature alarm if active
+  if (tempConfig.alarmActive && !tempConfig.alarmAcknowledged) {
+    tempConfig.alarmAcknowledged = true;
+    anyAlarmAcknowledged = true;
+    Serial.println("[ACK] Temperature alarm acknowledged");
+  }
+
+  // Acknowledge humidity alarm if active
+  if (humidityConfig.alarmActive && !humidityConfig.alarmAcknowledged) {
+    humidityConfig.alarmAcknowledged = true;
+    anyAlarmAcknowledged = true;
+    Serial.println("[ACK] Humidity alarm acknowledged");
+  }
+
+  // Acknowledge pressure alarm if active
+  if (pressureConfig.alarmActive && !pressureConfig.alarmAcknowledged) {
+    pressureConfig.alarmAcknowledged = true;
+    anyAlarmAcknowledged = true;
+    Serial.println("[ACK] Pressure alarm acknowledged");
+  }
+
+  // Acknowledge AQI alarm if active
+  if (aqiConfig.alarmActive && !aqiConfig.alarmAcknowledged) {
+    aqiConfig.alarmAcknowledged = true;
+    anyAlarmAcknowledged = true;
+    Serial.println("[ACK] AQI alarm acknowledged");
+  }
+
+  if (anyAlarmAcknowledged) {
+    Serial.println("[ACK] All active alarms acknowledged");
+  } else {
+    Serial.println("[ACK] No active alarms to acknowledge");
+  }
 }
 
 /* -------------------- PAGE 8 WIDGET CONFIG -------------------- */
@@ -395,36 +439,62 @@ int16_t parseAsciiToInt(const char *text) {
 
 /* -------------------- CHECK ALARM CONDITION -------------------- */
 /*
- * Returns true if alarm should be active.
- * Alarm triggers only if:
- *   - Data is valid (not NaN)
- *   - At least one limit is set
- *   - Value exceeds the set limit(s)
+ * Checks if value is out of limits.
+ * Also resets alarmAcknowledged flag when value returns to normal.
+ * Returns true if value is out of limits, false otherwise.
  */
 bool checkAlarmCondition(int value, ParameterConfig *config) {
   // No alarm if data is invalid
-  if (!config->dataValid) return false;
+  if (!config->dataValid) {
+    // Reset acknowledged flag when data is invalid
+    config->alarmAcknowledged = false;
+    return false;
+  }
   
   // No alarm if no limits are set
-  if (!config->upperLimitSet && !config->lowerLimitSet) return false;
+  if (!config->upperLimitSet && !config->lowerLimitSet) {
+    config->alarmAcknowledged = false;
+    return false;
+  }
+  
+  bool outOfLimits = false;
   
   // Check upper limit (only if set)
-  if (config->upperLimitSet && value > config->upperLimit) return true;
+  if (config->upperLimitSet && value > config->upperLimit) {
+    outOfLimits = true;
+  }
   
   // Check lower limit (only if set)
-  if (config->lowerLimitSet && value < config->lowerLimit) return true;
+  if (config->lowerLimitSet && value < config->lowerLimit) {
+    outOfLimits = true;
+  }
   
-  return false;
+  // If value is back within limits, reset the acknowledged flag
+  // This allows alarm to trigger again if value goes out of limits
+  if (!outOfLimits) {
+    config->alarmAcknowledged = false;
+  }
+  
+  return outOfLimits;
 }
 
 /* -------------------- GET ALARM STATE FOR PARAMETER -------------------- */
-bool getAlarmStateForParam(ParameterType param) {
+/*
+ * Returns true if alarm should be actively showing (blinking + buzzer)
+ * Alarm shows only if: alarmActive AND NOT alarmAcknowledged
+ */
+bool shouldShowAlarm(ParameterType param) {
   switch (param) {
-    case PARAM_TEMPERATURE: return tempConfig.alarmActive;
-    case PARAM_PRESSURE:    return pressureConfig.alarmActive;
-    case PARAM_HUMIDITY:    return humidityConfig.alarmActive;
-    case PARAM_AQI:         return aqiConfig.alarmActive;
-    default:                return false;
+    case PARAM_TEMPERATURE: 
+      return tempConfig.alarmActive && !tempConfig.alarmAcknowledged;
+    case PARAM_PRESSURE:    
+      return pressureConfig.alarmActive && !pressureConfig.alarmAcknowledged;
+    case PARAM_HUMIDITY:    
+      return humidityConfig.alarmActive && !humidityConfig.alarmAcknowledged;
+    case PARAM_AQI:         
+      return aqiConfig.alarmActive && !aqiConfig.alarmAcknowledged;
+    default:                
+      return false;
   }
 }
 
@@ -433,6 +503,8 @@ void alarmBlinkTask(void *pvParameters) {
   while (1) {
     // Toggle blink state
     alarmBlinkState = !alarmBlinkState;
+    
+    bool anyAlarmShowing = false;
     
     // Check each active widget
     for (uint8_t i = 0; i < 4; i++) {
@@ -444,17 +516,22 @@ void alarmBlinkTask(void *pvParameters) {
         continue;
       }
       
-      bool alarmActive = getAlarmStateForParam(param);
+      bool showAlarm = shouldShowAlarm(param);
       
-      if (alarmActive) {
-        // Alarm active - blink (0 = red line visible, 1 = no red line)
+      if (showAlarm) {
+        // Alarm active and not acknowledged - blink (0 = red line visible, 1 = no red line)
         uint16_t alarmValue = alarmBlinkState ? 1 : 0;
         dwinSendVP_u16(widgets[i].alarmVp, alarmValue);
-        dwinSendVP_u16(DWIN_BUZZER_VP, DWIN_BUZZER_ON);
+        anyAlarmShowing = true;
       } else {
-        // Alarm not active - ensure alarm is off (no red line)
+        // Alarm not active or acknowledged - ensure alarm is off (no red line)
         dwinSendVP_u16(widgets[i].alarmVp, 1);
       }
+    }
+    
+    // Sound buzzer only if any alarm is showing (not acknowledged)
+    if (anyAlarmShowing) {
+      dwinSendVP_u16(DWIN_BUZZER_VP, DWIN_BUZZER_ON);
     }
     
     vTaskDelay(pdMS_TO_TICKS(500));  // 500ms blink interval
@@ -520,7 +597,7 @@ void dwinDataRefreshTask(void *pvParameters) {
     // pressureConfig.dataValid remains false
     // pres_str remains "NaN"
 
-    // Check alarms for each parameter
+    // Check alarms for each parameter (also resets acknowledged flag when back in limits)
     tempConfig.alarmActive = checkAlarmCondition(currentTempValue, &tempConfig);
     humidityConfig.alarmActive = checkAlarmCondition(currentHumidityValue, &humidityConfig);
     pressureConfig.alarmActive = checkAlarmCondition(currentPressureValue, &pressureConfig);
@@ -582,6 +659,12 @@ void handleIntVP(uint16_t vp, uint16_t value) {
     case 0x5141:  // AQI enable
       aqiEnabled = (value == 0);
       changed = true;
+      break;
+    
+    // Alarm Acknowledge Button
+    case VP_ALARM_ACK:
+      Serial.println("[ACK] Alarm acknowledge button pressed");
+      acknowledgeAllAlarms();
       break;
   }
 
@@ -809,10 +892,10 @@ void readCalibrationAndLimitsFromDisplay() {
 /* -------------------- ARDUINO SETUP -------------------- */
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(3000);  // Wait for display to initialize
   Serial.println("===========================================");
   Serial.println("ESP32 + FreeRTOS + DWIN + Sensors");
-  Serial.println("Stage 3: Password Protected Settings");
+  Serial.println("Stage 4: Alarm Acknowledgement");
   Serial.println("===========================================");
 
   // Load password from EEPROM
