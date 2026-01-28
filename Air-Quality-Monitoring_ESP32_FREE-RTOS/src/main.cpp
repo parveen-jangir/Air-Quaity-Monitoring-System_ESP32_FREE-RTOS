@@ -60,6 +60,20 @@ int currentAqiValue = 0;
 // Alarm blink state (toggles every 500ms)
 bool alarmBlinkState = false;
 
+// Buzzer sound setting (default: ON)
+bool buzzerEnabled = true;
+
+/* -------------------- DATE & TIME VARIABLES -------------------- */
+uint8_t rtcYear   = 26;   // 2026 (offset from 2000)
+uint8_t rtcMonth  = 1;    // January
+uint8_t rtcDay    = 1;    // 1st
+uint8_t rtcHour   = 0;    // 00:xx
+uint8_t rtcMinute = 0;    // xx:00
+uint8_t rtcSecond = 0;    // xx:xx:00
+
+// Mutex for RTC variables (accessed by multiple tasks)
+SemaphoreHandle_t rtcMutex;
+
 /* -------------------- PASSWORD CONFIGURATION -------------------- */
 #define DEFAULT_SETTINGS_PASSWORD   "123456"
 #define ADVANCED_SETTINGS_PASSWORD  "124578"
@@ -73,6 +87,9 @@ char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
 #define PAGE_ADVANCED_SETTINGS 0x0A
 
 /* -------------------- VP ADDRESSES -------------------- */
+// DWIN RTC Register
+#define VP_DWIN_RTC             0x0010
+
 // Calibration Offset VPs (ASCII, 4 bytes)
 #define VP_TEMP_CALIBRATION     0x5215
 #define VP_HUMIDITY_CALIBRATION 0x5225
@@ -103,6 +120,13 @@ char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
 // Alarm Acknowledge VP
 #define VP_ALARM_ACK            0x5001
 
+// Buzzer Sound Setting VP
+#define VP_BUZZER_SETTING       0x5151
+
+// Date & Time Input VPs (ASCII)
+#define VP_DATE_INPUT           0x5410
+#define VP_TIME_INPUT           0x5430
+
 /* -------------------- VP TYPE MAP -------------------- */
 vp_type_t getVpType(uint16_t vp) {
   switch (vp) {
@@ -130,6 +154,9 @@ vp_type_t getVpType(uint16_t vp) {
     case VP_SETTINGS_PASSWORD_ENTRY:
     case VP_SETTINGS_PASSWORD_CHANGE:
     case VP_ADVANCED_PASSWORD_ENTRY:
+    // Date & Time VPs (Text/ASCII)
+    case VP_DATE_INPUT:
+    case VP_TIME_INPUT:
       return VP_TYPE_STRING;
 
     // Settings VPs (INT)
@@ -139,7 +166,8 @@ vp_type_t getVpType(uint16_t vp) {
     case 0x5121:  // Pressure enable
     case 0x5131:  // Humidity enable
     case 0x5141:  // AQI enable
-    case VP_ALARM_ACK:  // Alarm acknowledge button
+    case VP_ALARM_ACK:      // Alarm acknowledge button
+    case VP_BUZZER_SETTING: // Buzzer sound on/off
       return VP_TYPE_INT;
 
     default:
@@ -209,6 +237,199 @@ void dwinReadVP(uint16_t vp, uint8_t wordCount) {
     DWIN_UART.write(frame, sizeof(frame));
     DWIN_UART.flush();
     xSemaphoreGive(dwinUartMutex);
+  }
+}
+
+/* -------------------- DATE & TIME FUNCTIONS -------------------- */
+
+// Check if year is leap year (year is offset from 2000, e.g., 26 = 2026)
+bool isLeapYear(uint8_t year) {
+  uint16_t fullYear = 2000 + year;
+  return (fullYear % 4 == 0 && fullYear % 100 != 0) || (fullYear % 400 == 0);
+}
+
+// Get days in month
+uint8_t getDaysInMonth(uint8_t month, uint8_t year) {
+  switch (month) {
+    case 1:  return 31;  // January
+    case 2:  return isLeapYear(year) ? 29 : 28;  // February
+    case 3:  return 31;  // March
+    case 4:  return 30;  // April
+    case 5:  return 31;  // May
+    case 6:  return 30;  // June
+    case 7:  return 31;  // July
+    case 8:  return 31;  // August
+    case 9:  return 30;  // September
+    case 10: return 31;  // October
+    case 11: return 30;  // November
+    case 12: return 31;  // December
+    default: return 31;
+  }
+}
+
+// Send current date/time to DWIN RTC register
+void dwinUpdateRTC() {
+  // Command: 5A A5 0B 82 00 10 [YY] [MM] [DD] [WW] [HH] [mm] [ss] 00
+  uint8_t frame[14] = {
+    0x5A, 0xA5, 0x0B,
+    0x82,
+    0x00, 0x10,
+    rtcYear,
+    rtcMonth,
+    rtcDay,
+    0x00,       // Week day (not used)
+    rtcHour,
+    rtcMinute,
+    rtcSecond,
+    0x00        // End byte
+  };
+
+  if (xSemaphoreTake(dwinUartMutex, portMAX_DELAY) == pdTRUE) {
+    DWIN_UART.write(frame, sizeof(frame));
+    DWIN_UART.flush();
+    xSemaphoreGive(dwinUartMutex);
+  }
+}
+
+// Parse date string "DD/MM/YYYY" and update RTC
+bool parseDateInput(const char *text) {
+  if (text == NULL || strlen(text) < 10) return false;
+
+  // Expected format: DD/MM/YYYY (e.g., "01/02/2026")
+  int day, month, year;
+  
+  if (sscanf(text, "%d/%d/%d", &day, &month, &year) != 3) {
+    Serial.println("[RTC] Failed to parse date format");
+    return false;
+  }
+
+  // Validate ranges
+  if (year < 2000 || year > 2099) {
+    Serial.printf("[RTC] Invalid year: %d\n", year);
+    return false;
+  }
+  if (month < 1 || month > 12) {
+    Serial.printf("[RTC] Invalid month: %d\n", month);
+    return false;
+  }
+  
+  uint8_t yearOffset = year - 2000;
+  uint8_t maxDays = getDaysInMonth(month, yearOffset);
+  
+  if (day < 1 || day > maxDays) {
+    Serial.printf("[RTC] Invalid day: %d (max %d for month %d)\n", day, maxDays, month);
+    return false;
+  }
+
+  // Update RTC variables with mutex protection
+  if (xSemaphoreTake(rtcMutex, portMAX_DELAY) == pdTRUE) {
+    rtcYear = yearOffset;
+    rtcMonth = month;
+    rtcDay = day;
+    xSemaphoreGive(rtcMutex);
+  }
+
+  Serial.printf("[RTC] Date set to: %02d/%02d/%04d\n", rtcDay, rtcMonth, 2000 + rtcYear);
+  
+  // Immediately update display
+  dwinUpdateRTC();
+  
+  return true;
+}
+
+// Parse time string "HH;MM" and update RTC
+bool parseTimeInput(const char *text) {
+  if (text == NULL || strlen(text) < 5) return false;
+
+  // Expected format: HH;MM (e.g., "01;02")
+  int hour, minute;
+  
+  if (sscanf(text, "%d;%d", &hour, &minute) != 2) {
+    Serial.println("[RTC] Failed to parse time format");
+    return false;
+  }
+
+  // Validate ranges
+  if (hour < 0 || hour > 23) {
+    Serial.printf("[RTC] Invalid hour: %d\n", hour);
+    return false;
+  }
+  if (minute < 0 || minute > 59) {
+    Serial.printf("[RTC] Invalid minute: %d\n", minute);
+    return false;
+  }
+
+  // Update RTC variables with mutex protection
+  if (xSemaphoreTake(rtcMutex, portMAX_DELAY) == pdTRUE) {
+    rtcHour = hour;
+    rtcMinute = minute;
+    rtcSecond = 0;  // Reset seconds to 0
+    xSemaphoreGive(rtcMutex);
+  }
+
+  Serial.printf("[RTC] Time set to: %02d:%02d:00\n", rtcHour, rtcMinute);
+  
+  // Immediately update display
+  dwinUpdateRTC();
+  
+  return true;
+}
+
+// Increment time by 1 second (called every second)
+void rtcTick() {
+  if (xSemaphoreTake(rtcMutex, portMAX_DELAY) == pdTRUE) {
+    rtcSecond++;
+    
+    if (rtcSecond >= 60) {
+      rtcSecond = 0;
+      rtcMinute++;
+      
+      if (rtcMinute >= 60) {
+        rtcMinute = 0;
+        rtcHour++;
+        
+        if (rtcHour >= 24) {
+          rtcHour = 0;
+          rtcDay++;
+          
+          uint8_t maxDays = getDaysInMonth(rtcMonth, rtcYear);
+          if (rtcDay > maxDays) {
+            rtcDay = 1;
+            rtcMonth++;
+            
+            if (rtcMonth > 12) {
+              rtcMonth = 1;
+              rtcYear++;
+              
+              // Handle year overflow (99 -> 0)
+              if (rtcYear > 99) {
+                rtcYear = 0;
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    xSemaphoreGive(rtcMutex);
+  }
+}
+
+/* -------------------- RTC TASK -------------------- */
+void rtcTask(void *pvParameters) {
+  while (1) {
+    // Tick every second
+    rtcTick();
+    
+    // Update display every minute (when seconds == 0)
+    if (rtcSecond == 0) {
+      dwinUpdateRTC();
+      Serial.printf("[RTC] %02d/%02d/%04d %02d:%02d:%02d\n", 
+                    rtcDay, rtcMonth, 2000 + rtcYear, 
+                    rtcHour, rtcMinute, rtcSecond);
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(1000));  // 1 second delay
   }
 }
 
@@ -529,8 +750,8 @@ void alarmBlinkTask(void *pvParameters) {
       }
     }
     
-    // Sound buzzer only if any alarm is showing (not acknowledged)
-    if (anyAlarmShowing) {
+    // Sound buzzer only if buzzer is enabled AND any alarm is showing
+    if (buzzerEnabled && anyAlarmShowing) {
       dwinSendVP_u16(DWIN_BUZZER_VP, DWIN_BUZZER_ON);
     }
     
@@ -666,6 +887,12 @@ void handleIntVP(uint16_t vp, uint16_t value) {
       Serial.println("[ACK] Alarm acknowledge button pressed");
       acknowledgeAllAlarms();
       break;
+
+    // Buzzer Sound Setting
+    case VP_BUZZER_SETTING:
+      buzzerEnabled = (value == 0);
+      Serial.printf("[BUZZER] Alarm sound %s\n", buzzerEnabled ? "ON" : "OFF");
+      break;
   }
 
   if (changed) {
@@ -708,6 +935,26 @@ void handleStringVP(uint16_t vp, const char *text) {
         dwinSwitchPage(PAGE_ADVANCED_SETTINGS);
       } else {
         Serial.println("  -> Password INCORRECT!");
+      }
+      return;
+
+    // -------- Date Input --------
+    case VP_DATE_INPUT:
+      Serial.printf("  -> Date input received: %s\n", text);
+      if (parseDateInput(text)) {
+        Serial.println("  -> Date updated successfully!");
+      } else {
+        Serial.println("  -> Failed to parse date!");
+      }
+      return;
+
+    // -------- Time Input --------
+    case VP_TIME_INPUT:
+      Serial.printf("  -> Time input received: %s\n", text);
+      if (parseTimeInput(text)) {
+        Serial.println("  -> Time updated successfully!");
+      } else {
+        Serial.println("  -> Failed to parse time!");
       }
       return;
   }
@@ -895,7 +1142,7 @@ void setup() {
   delay(3000);  // Wait for display to initialize
   Serial.println("===========================================");
   Serial.println("ESP32 + FreeRTOS + DWIN + Sensors");
-  Serial.println("Stage 4: Alarm Acknowledgement");
+  Serial.println("Stage 6: Buzzer Sound Setting");
   Serial.println("===========================================");
 
   // Load password from EEPROM
@@ -916,15 +1163,23 @@ void setup() {
 
   dwinUartMutex = xSemaphoreCreateMutex();
   if (dwinUartMutex == NULL) {
-    Serial.println("[FATAL] Failed to create UART mutex");
+    Serial.println("[FATAL] Failed to create DWIN UART mutex");
     while (1);
   }
-  Serial.println("[OK] UART mutex created");
+  Serial.println("[OK] DWIN UART mutex created");
+
+  rtcMutex = xSemaphoreCreateMutex();
+  if (rtcMutex == NULL) {
+    Serial.println("[FATAL] Failed to create RTC mutex");
+    while (1);
+  }
+  Serial.println("[OK] RTC mutex created");
 
   // Create FreeRTOS tasks
   xTaskCreate(dwinRxTask, "DWIN_RX", 4096, NULL, 2, NULL);
   xTaskCreate(dwinDataRefreshTask, "DWIN_REFRESH", 4096, NULL, 2, NULL);
   xTaskCreate(alarmBlinkTask, "ALARM_BLINK", 2048, NULL, 1, NULL);
+  xTaskCreate(rtcTask, "RTC_TASK", 2048, NULL, 1, NULL);
   Serial.println("[OK] FreeRTOS tasks created");
 
   // Initial state sync - Settings VPs
@@ -945,6 +1200,16 @@ void setup() {
   // Read calibration and limits from display
   Serial.println("Reading calibration & limits VPs...");
   readCalibrationAndLimitsFromDisplay();
+
+  // Send initial date/time to display
+  Serial.println("Initializing RTC...");
+  Serial.printf("[RTC] Default: %02d/%02d/%04d %02d:%02d:%02d\n", 
+                rtcDay, rtcMonth, 2000 + rtcYear, 
+                rtcHour, rtcMinute, rtcSecond);
+  dwinUpdateRTC();
+
+  // Log default buzzer setting
+  Serial.printf("[BUZZER] Default: Alarm sound %s\n", buzzerEnabled ? "ON" : "OFF");
 
   Serial.println("===========================================");
   Serial.println("Setup complete! System running.");
