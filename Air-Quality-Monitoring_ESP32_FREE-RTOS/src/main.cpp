@@ -6,6 +6,44 @@
 #include "freertos/semphr.h"
 #include "Adafruit_SHT31.h"
 #include "Adafruit_SGP40.h"
+#include <ModbusRTU.h>
+#include <SoftwareSerial.h>
+
+/* -------------------- MODBUS CONFIG -------------------- */
+#define MODBUS_TX_PIN     14
+#define MODBUS_RX_PIN     13
+#define MODBUS_DE_PIN     4
+
+#define MODBUS_DEFAULT_SLAVE_ID   1
+#define MODBUS_DEFAULT_BAUD       9600
+
+#define MODBUS_DISABLED_VALUE     -9999
+
+// MODBUS Register Addresses - Holding Registers (R/W)
+#define HREG_TEMP_ENABLE      0
+#define HREG_HUMIDITY_ENABLE  1
+#define HREG_PRESSURE_ENABLE  2
+#define HREG_AQI_ENABLE       3
+#define HREG_TEMP_OFFSET      4
+#define HREG_HUMIDITY_OFFSET  5
+#define HREG_PRESSURE_OFFSET  6
+#define HREG_AQI_OFFSET       7
+#define HREG_ALARM_ACK        8
+#define HREG_COUNT            9
+
+// MODBUS Register Addresses - Input Registers (R)
+#define IREG_TEMP_VALUE       0
+#define IREG_HUMIDITY_VALUE   1
+#define IREG_PRESSURE_VALUE   2
+#define IREG_AQI_VALUE        3
+#define IREG_TEMP_UNIT        4
+#define IREG_PRESSURE_UNIT    5
+#define IREG_COUNT            6
+
+// MODBUS Settings VPs
+#define VP_MODBUS_ENABLE      0x5500
+#define VP_MODBUS_SLAVE_ID    0x5510
+#define VP_MODBUS_BAUD_RATE   0x5530
 
 /* -------------------- DWIN UART CONFIG -------------------- */
 #define DWIN_UART Serial2
@@ -14,6 +52,18 @@
 #define DWIN_BAUD   115200
 
 #define DWIN_MAX_FRAME 256
+
+/* -------------------- MODBUS GLOBALS -------------------- */
+SoftwareSerial modbusSerial(MODBUS_RX_PIN, MODBUS_TX_PIN);
+ModbusRTU mb;
+
+bool modbusEnabled = true;          // Default: ON
+uint8_t modbusSlaveId = MODBUS_DEFAULT_SLAVE_ID;
+uint32_t modbusBaudRate = MODBUS_DEFAULT_BAUD;
+
+// Flag to track if MODBUS needs reinitialization
+bool modbusNeedsReinit = false;
+bool modbusInternalWrite = false;
 
 /* -------------------- GLOBALS -------------------- */
 SemaphoreHandle_t dwinUartMutex;
@@ -157,8 +207,12 @@ vp_type_t getVpType(uint16_t vp) {
     // Date & Time VPs (Text/ASCII)
     case VP_DATE_INPUT:
     case VP_TIME_INPUT:
+    case VP_MODBUS_SLAVE_ID:
+    case VP_MODBUS_BAUD_RATE:
       return VP_TYPE_STRING;
 
+    // MODBUS Enable VP (INT)
+    
     // Settings VPs (INT)
     case 0x5110:  // Temp unit
     case 0x5111:  // Temp enable
@@ -168,6 +222,7 @@ vp_type_t getVpType(uint16_t vp) {
     case 0x5141:  // AQI enable
     case VP_ALARM_ACK:      // Alarm acknowledge button
     case VP_BUZZER_SETTING: // Buzzer sound on/off
+    case VP_MODBUS_ENABLE:
       return VP_TYPE_INT;
 
     default:
@@ -759,6 +814,224 @@ void alarmBlinkTask(void *pvParameters) {
   }
 }
 
+/* -------------------- MODBUS CALLBACK FUNCTIONS -------------------- */
+
+// Callback when Holding Register is written by MODBUS master
+uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
+  if (modbusInternalWrite) {
+    return val;
+  }
+  uint16_t regAddr = reg->address.address;
+  
+  Serial.printf("[MODBUS] Hreg %d written with value: %d\n", regAddr, val);
+
+  switch (regAddr) {
+    case HREG_TEMP_ENABLE:
+      tempEnabled = (val == 0);
+      // Sync to DWIN display
+      dwinSendVP_u16(0x5111, val);
+      refreshDashboard();
+      Serial.printf("[MODBUS] Temperature %s\n", tempEnabled ? "ENABLED" : "DISABLED");
+      break;
+
+    case HREG_HUMIDITY_ENABLE:
+      humidityEnabled = (val == 0);
+      dwinSendVP_u16(0x5131, val);
+      refreshDashboard();
+      Serial.printf("[MODBUS] Humidity %s\n", humidityEnabled ? "ENABLED" : "DISABLED");
+      break;
+
+    case HREG_PRESSURE_ENABLE:
+      pressureEnabled = (val == 0);
+      dwinSendVP_u16(0x5121, val);
+      refreshDashboard();
+      Serial.printf("[MODBUS] Pressure %s\n", pressureEnabled ? "ENABLED" : "DISABLED");
+      break;
+
+    case HREG_AQI_ENABLE:
+      aqiEnabled = (val == 0);
+      dwinSendVP_u16(0x5141, val);
+      refreshDashboard();
+      Serial.printf("[MODBUS] AQI %s\n", aqiEnabled ? "ENABLED" : "DISABLED");
+      break;
+
+    case HREG_TEMP_OFFSET:
+      tempConfig.offset = (int16_t)val;
+      // Sync to DWIN display (send as ASCII)
+      {
+        char offsetStr[8];
+        snprintf(offsetStr, sizeof(offsetStr), "%d", tempConfig.offset);
+        uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+        size_t len = strlen(offsetStr);
+        if (len > 4) len = 4;
+        memcpy(dataBytes, offsetStr, len);
+        dwinSendVP(VP_TEMP_CALIBRATION, dataBytes, 4);
+      }
+      Serial.printf("[MODBUS] Temp offset set to: %d\n", tempConfig.offset);
+      break;
+
+    case HREG_HUMIDITY_OFFSET:
+      humidityConfig.offset = (int16_t)val;
+      {
+        char offsetStr[8];
+        snprintf(offsetStr, sizeof(offsetStr), "%d", humidityConfig.offset);
+        uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+        size_t len = strlen(offsetStr);
+        if (len > 4) len = 4;
+        memcpy(dataBytes, offsetStr, len);
+        dwinSendVP(VP_HUMIDITY_CALIBRATION, dataBytes, 4);
+      }
+      Serial.printf("[MODBUS] Humidity offset set to: %d\n", humidityConfig.offset);
+      break;
+
+    case HREG_PRESSURE_OFFSET:
+      pressureConfig.offset = (int16_t)val;
+      {
+        char offsetStr[8];
+        snprintf(offsetStr, sizeof(offsetStr), "%d", pressureConfig.offset);
+        uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+        size_t len = strlen(offsetStr);
+        if (len > 4) len = 4;
+        memcpy(dataBytes, offsetStr, len);
+        dwinSendVP(VP_PRESSURE_CALIBRATION, dataBytes, 4);
+      }
+      Serial.printf("[MODBUS] Pressure offset set to: %d\n", pressureConfig.offset);
+      break;
+
+    case HREG_AQI_OFFSET:
+      aqiConfig.offset = (int16_t)val;
+      {
+        char offsetStr[8];
+        snprintf(offsetStr, sizeof(offsetStr), "%d", aqiConfig.offset);
+        uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+        size_t len = strlen(offsetStr);
+        if (len > 4) len = 4;
+        memcpy(dataBytes, offsetStr, len);
+        dwinSendVP(VP_AQI_CALIBRATION, dataBytes, 4);
+      }
+      Serial.printf("[MODBUS] AQI offset set to: %d\n", aqiConfig.offset);
+      break;
+
+    case HREG_ALARM_ACK:
+      if (val == 1) {
+        acknowledgeAllAlarms();
+        // Reset the register value back to 0
+        mb.Hreg(HREG_ALARM_ACK, 0);
+      }
+      break;
+  }
+
+  return val;
+}
+
+/* -------------------- MODBUS INITIALIZATION -------------------- */
+void initModbus() {
+  Serial.println("[MODBUS] Initializing...");
+
+  // End previous serial if reinitializing
+  modbusSerial.end();
+  delay(10);
+
+  // Start SoftwareSerial
+  modbusSerial.begin(modbusBaudRate);
+
+  // Initialize Modbus RTU
+  mb.begin(&modbusSerial, MODBUS_DE_PIN);
+  mb.slave(modbusSlaveId);
+
+  // Add Holding Registers (R/W)
+  for (uint16_t i = 0; i < HREG_COUNT; i++) {
+    mb.addHreg(i, 0);
+  }
+
+  // Add Input Registers (R)
+  for (uint16_t i = 0; i < IREG_COUNT; i++) {
+    mb.addIreg(i, 0);
+  }
+
+  // Set initial values for Holding Registers
+  mb.Hreg(HREG_TEMP_ENABLE, tempEnabled ? 0 : 1);
+  mb.Hreg(HREG_HUMIDITY_ENABLE, humidityEnabled ? 0 : 1);
+  mb.Hreg(HREG_PRESSURE_ENABLE, pressureEnabled ? 0 : 1);
+  mb.Hreg(HREG_AQI_ENABLE, aqiEnabled ? 0 : 1);
+  mb.Hreg(HREG_TEMP_OFFSET, (uint16_t)tempConfig.offset);
+  mb.Hreg(HREG_HUMIDITY_OFFSET, (uint16_t)humidityConfig.offset);
+  mb.Hreg(HREG_PRESSURE_OFFSET, (uint16_t)pressureConfig.offset);
+  mb.Hreg(HREG_AQI_OFFSET, (uint16_t)aqiConfig.offset);
+  mb.Hreg(HREG_ALARM_ACK, 0);
+
+  // Set callback for Holding Register writes
+  mb.onSetHreg(HREG_TEMP_ENABLE, modbusOnHregSet);
+  mb.onSetHreg(HREG_HUMIDITY_ENABLE, modbusOnHregSet);
+  mb.onSetHreg(HREG_PRESSURE_ENABLE, modbusOnHregSet);
+  mb.onSetHreg(HREG_AQI_ENABLE, modbusOnHregSet);
+  mb.onSetHreg(HREG_TEMP_OFFSET, modbusOnHregSet);
+  mb.onSetHreg(HREG_HUMIDITY_OFFSET, modbusOnHregSet);
+  mb.onSetHreg(HREG_PRESSURE_OFFSET, modbusOnHregSet);
+  mb.onSetHreg(HREG_AQI_OFFSET, modbusOnHregSet);
+  mb.onSetHreg(HREG_ALARM_ACK, modbusOnHregSet);
+
+  modbusNeedsReinit = false;
+
+  Serial.printf("[MODBUS] Initialized - Slave ID: %d, Baud: %lu\n", 
+                modbusSlaveId, modbusBaudRate);
+}
+
+/* -------------------- MODBUS UPDATE INPUT REGISTERS -------------------- */
+void updateModbusInputRegisters() {
+  if (!modbusEnabled) return;
+
+  // Temperature
+  if (tempEnabled && tempConfig.dataValid) {
+    mb.Ireg(IREG_TEMP_VALUE, (uint16_t)currentTempValue);
+  } else {
+    mb.Ireg(IREG_TEMP_VALUE, (uint16_t)MODBUS_DISABLED_VALUE);
+  }
+
+  // Humidity
+  if (humidityEnabled && humidityConfig.dataValid) {
+    mb.Ireg(IREG_HUMIDITY_VALUE, (uint16_t)currentHumidityValue);
+  } else {
+    mb.Ireg(IREG_HUMIDITY_VALUE, (uint16_t)MODBUS_DISABLED_VALUE);
+  }
+
+  // Pressure
+  if (pressureEnabled && pressureConfig.dataValid) {
+    mb.Ireg(IREG_PRESSURE_VALUE, (uint16_t)currentPressureValue);
+  } else {
+    mb.Ireg(IREG_PRESSURE_VALUE, (uint16_t)MODBUS_DISABLED_VALUE);
+  }
+
+  // AQI
+  if (aqiEnabled && aqiConfig.dataValid) {
+    mb.Ireg(IREG_AQI_VALUE, (uint16_t)currentAqiValue);
+  } else {
+    mb.Ireg(IREG_AQI_VALUE, (uint16_t)MODBUS_DISABLED_VALUE);
+  }
+
+  // Units (0=°F/mmH₂O, 1=°C/Pa)
+  mb.Ireg(IREG_TEMP_UNIT, (tempUnit == UNIT_C) ? 1 : 0);
+  mb.Ireg(IREG_PRESSURE_UNIT, (pressureUnit == UNIT_PA) ? 1 : 0);
+}
+
+/* -------------------- MODBUS TASK -------------------- */
+void modbusTask(void *pvParameters) {
+  while (1) {
+    // Check if reinitialization needed (settings changed)
+    if (modbusNeedsReinit && modbusEnabled) {
+      initModbus();
+    }
+
+    // Process MODBUS requests only if enabled
+    if (modbusEnabled) {
+      mb.task();
+      yield();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
 /* -------------------- SENSOR READING & DATA REFRESH TASK -------------------- */
 void dwinDataRefreshTask(void *pvParameters) {
   while (1) {
@@ -846,6 +1119,25 @@ void dwinDataRefreshTask(void *pvParameters) {
       dwinSendVP(widgets[i].dataVp, dataBytes, 4);
     }
 
+    // Update MODBUS input registers with latest sensor data
+    updateModbusInputRegisters();
+    
+    // Sync holding registers (with flag to prevent callback)
+    if (modbusEnabled) {
+      modbusInternalWrite = true;  // Set flag
+      
+      mb.Hreg(HREG_TEMP_ENABLE, tempEnabled ? 0 : 1);
+      mb.Hreg(HREG_HUMIDITY_ENABLE, humidityEnabled ? 0 : 1);
+      mb.Hreg(HREG_PRESSURE_ENABLE, pressureEnabled ? 0 : 1);
+      mb.Hreg(HREG_AQI_ENABLE, aqiEnabled ? 0 : 1);
+      mb.Hreg(HREG_TEMP_OFFSET, (uint16_t)tempConfig.offset);
+      mb.Hreg(HREG_HUMIDITY_OFFSET, (uint16_t)humidityConfig.offset);
+      mb.Hreg(HREG_PRESSURE_OFFSET, (uint16_t)pressureConfig.offset);
+      mb.Hreg(HREG_AQI_OFFSET, (uint16_t)aqiConfig.offset);
+      
+      modbusInternalWrite = false;  // Clear flag
+    }
+
     vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
@@ -893,11 +1185,65 @@ void handleIntVP(uint16_t vp, uint16_t value) {
       buzzerEnabled = (value == 0);
       Serial.printf("[BUZZER] Alarm sound %s\n", buzzerEnabled ? "ON" : "OFF");
       break;
+
+    // MODBUS Enable/Disable
+    case VP_MODBUS_ENABLE:
+      modbusEnabled = (value == 0);
+      Serial.printf("[MODBUS] %s\n", modbusEnabled ? "ENABLED" : "DISABLED");
+      break;
   }
 
   if (changed) {
     refreshDashboard();
   }
+}
+
+/* -------------------- MODBUS EEPROM FUNCTIONS -------------------- */
+void loadModbusSettingsFromEEPROM() {
+  preferences.begin("modbus", true);  // Read-only mode
+  modbusSlaveId = preferences.getUChar("slaveId", MODBUS_DEFAULT_SLAVE_ID);
+  modbusBaudRate = preferences.getULong("baudRate", MODBUS_DEFAULT_BAUD);
+  preferences.end();
+
+  // Validate slave ID (1-247)
+  if (modbusSlaveId < 1 || modbusSlaveId > 247) {
+    modbusSlaveId = MODBUS_DEFAULT_SLAVE_ID;
+  }
+
+  Serial.printf("[MODBUS] Loaded settings - Slave ID: %d, Baud Rate: %lu\n", 
+                modbusSlaveId, modbusBaudRate);
+}
+
+void saveModbusSlaveIdToEEPROM(uint8_t slaveId) {
+  if (slaveId < 1 || slaveId > 247) {
+    Serial.println("[MODBUS] Invalid slave ID, not saving");
+    return;
+  }
+  
+  preferences.begin("modbus", false);  // Read-write mode
+  preferences.putUChar("slaveId", slaveId);
+  preferences.end();
+
+  modbusSlaveId = slaveId;
+  modbusNeedsReinit = true;
+  Serial.printf("[MODBUS] Saved Slave ID: %d\n", modbusSlaveId);
+}
+
+void saveModbusBaudRateToEEPROM(uint32_t baudRate) {
+  // Validate baud rate
+  if (baudRate != 9600 && baudRate != 19200 && baudRate != 38400 && 
+      baudRate != 57600 && baudRate != 115200) {
+    Serial.printf("[MODBUS] Invalid baud rate: %lu, not saving\n", baudRate);
+    return;
+  }
+  
+  preferences.begin("modbus", false);  // Read-write mode
+  preferences.putULong("baudRate", baudRate);
+  preferences.end();
+
+  modbusBaudRate = baudRate;
+  modbusNeedsReinit = true;
+  Serial.printf("[MODBUS] Saved Baud Rate: %lu\n", modbusBaudRate);
 }
 
 void handleStringVP(uint16_t vp, const char *text) {
@@ -955,6 +1301,30 @@ void handleStringVP(uint16_t vp, const char *text) {
         Serial.println("  -> Time updated successfully!");
       } else {
         Serial.println("  -> Failed to parse time!");
+      }
+      return;
+    
+    // -------- MODBUS Slave ID --------
+    case VP_MODBUS_SLAVE_ID:
+      Serial.printf("  -> MODBUS Slave ID input: %s\n", text);
+      if (isValidNumber(text)) {
+        int slaveId = atoi(text);
+        if (slaveId >= 1 && slaveId <= 247) {
+          saveModbusSlaveIdToEEPROM((uint8_t)slaveId);
+          Serial.printf("  -> Slave ID set to: %d\n", slaveId);
+        } else {
+          Serial.println("  -> Invalid Slave ID (must be 1-247)");
+        }
+      }
+      return;
+
+    // -------- MODBUS Baud Rate --------
+    case VP_MODBUS_BAUD_RATE:
+      Serial.printf("  -> MODBUS Baud Rate input: %s\n", text);
+      if (isValidNumber(text)) {
+        uint32_t baudRate = (uint32_t)atol(text);
+        saveModbusBaudRateToEEPROM(baudRate);
+        Serial.printf("  -> Baud Rate set to: %lu\n", baudRate);
       }
       return;
   }
@@ -1142,7 +1512,6 @@ void setup() {
   delay(3000);  // Wait for display to initialize
   Serial.println("===========================================");
   Serial.println("ESP32 + FreeRTOS + DWIN + Sensors");
-  Serial.println("Stage 6: Buzzer Sound Setting");
   Serial.println("===========================================");
 
   // Load password from EEPROM
@@ -1207,6 +1576,16 @@ void setup() {
                 rtcDay, rtcMonth, 2000 + rtcYear, 
                 rtcHour, rtcMinute, rtcSecond);
   dwinUpdateRTC();
+
+  // Load MODBUS settings from EEPROM
+  loadModbusSettingsFromEEPROM();
+
+  // Initialize MODBUS
+  initModbus();
+
+  // Create MODBUS task
+  xTaskCreate(modbusTask, "MODBUS_TASK", 4096, NULL, 1, NULL);
+  Serial.println("[OK] MODBUS task created");
 
   // Log default buzzer setting
   Serial.printf("[BUZZER] Default: Alarm sound %s\n", buzzerEnabled ? "ON" : "OFF");
