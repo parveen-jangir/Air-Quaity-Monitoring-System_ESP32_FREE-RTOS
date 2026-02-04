@@ -177,6 +177,20 @@ char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
 #define VP_DATE_INPUT           0x5410
 #define VP_TIME_INPUT           0x5430
 
+// Factory Reset VP
+#define VP_FACTORY_RESET        0x5550
+
+// Username VP
+#define VP_USERNAME             0x5440
+#define USERNAME_MAX_LENGTH     15
+#define DEFAULT_USERNAME        "Name"
+
+// Dismplay Initialization Delay (ms)
+#define DISPLAY_INIT_DELAY      2000
+
+// Username (stored in EEPROM)
+char username[USERNAME_MAX_LENGTH + 1] = DEFAULT_USERNAME;
+
 /* -------------------- VP TYPE MAP -------------------- */
 vp_type_t getVpType(uint16_t vp) {
   switch (vp) {
@@ -209,6 +223,10 @@ vp_type_t getVpType(uint16_t vp) {
     case VP_TIME_INPUT:
     case VP_MODBUS_SLAVE_ID:
     case VP_MODBUS_BAUD_RATE:
+    // Factory Reset VP (Text/ASCII)
+    case VP_FACTORY_RESET:
+        // Username VP (Text/ASCII)
+    case VP_USERNAME:
       return VP_TYPE_STRING;
 
     // MODBUS Enable VP (INT)
@@ -255,6 +273,45 @@ void dwinSendVP(uint16_t vp, const uint8_t *data, uint8_t length) {
 void dwinSendVP_u16(uint16_t vp, uint16_t value) {
   uint8_t data[2] = {(uint8_t)(value >> 8), (uint8_t)(value & 0xFF)};
   dwinSendVP(vp, data, 2);
+}
+
+/* -------------------- USERNAME FUNCTIONS -------------------- */
+void loadUsernameFromEEPROM() {
+  preferences.begin("settings", true);  // Read-only mode
+  String storedUsername = preferences.getString("username", DEFAULT_USERNAME);
+  preferences.end();
+
+  // Copy to username array
+  strncpy(username, storedUsername.c_str(), USERNAME_MAX_LENGTH);
+  username[USERNAME_MAX_LENGTH] = '\0';
+
+  Serial.printf("[EEPROM] Loaded username: %s\n", username);
+}
+
+void saveUsernameToEEPROM(const char *newUsername) {
+  if (newUsername == NULL) return;
+  
+  preferences.begin("settings", false);  // Read-write mode
+  preferences.putString("username", newUsername);
+  preferences.end();
+
+  // Update local copy
+  strncpy(username, newUsername, USERNAME_MAX_LENGTH);
+  username[USERNAME_MAX_LENGTH] = '\0';
+
+  Serial.printf("[EEPROM] Saved username: %s\n", username);
+}
+
+void sendUsernameToDwin() {
+  uint8_t dataBytes[USERNAME_MAX_LENGTH + 1];
+  memset(dataBytes, 0xFF, sizeof(dataBytes));
+  
+  size_t len = strlen(username);
+  if (len > USERNAME_MAX_LENGTH) len = USERNAME_MAX_LENGTH;
+  memcpy(dataBytes, username, len);
+  
+  dwinSendVP(VP_USERNAME, dataBytes, USERNAME_MAX_LENGTH);
+  Serial.printf("[DWIN] Sent username: %s\n", username);
 }
 
 /* -------------------- DWIN SWITCH PAGE -------------------- */
@@ -814,6 +871,252 @@ void alarmBlinkTask(void *pvParameters) {
   }
 }
 
+/* -------------------- SETTINGS PERSISTENCE FUNCTIONS -------------------- */
+
+// Save all settings to EEPROM
+void saveAllSettingsToEEPROM() {
+  preferences.begin("settings", false);  // Read-write mode
+  
+  // Enable states (store as 0=enabled, 1=disabled to match DWIN)
+  preferences.putBool("tempEn", tempEnabled);
+  preferences.putBool("humEn", humidityEnabled);
+  preferences.putBool("presEn", pressureEnabled);
+  preferences.putBool("aqiEn", aqiEnabled);
+  
+  // Units
+  preferences.putUChar("tempUnit", (uint8_t)tempUnit);
+  preferences.putUChar("presUnit", (uint8_t)pressureUnit);
+  
+  // Buzzer
+  preferences.putBool("buzzerEn", buzzerEnabled);
+  
+  // MODBUS Enable
+  preferences.putBool("modbusEn", modbusEnabled);
+  
+  // Calibration offsets
+  preferences.putShort("tempOff", tempConfig.offset);
+  preferences.putShort("humOff", humidityConfig.offset);
+  preferences.putShort("presOff", pressureConfig.offset);
+  preferences.putShort("aqiOff", aqiConfig.offset);
+  
+  // Temperature limits
+  preferences.putShort("tempUL", tempConfig.upperLimit);
+  preferences.putBool("tempULS", tempConfig.upperLimitSet);
+  preferences.putShort("tempLL", tempConfig.lowerLimit);
+  preferences.putBool("tempLLS", tempConfig.lowerLimitSet);
+  
+  // Humidity limits
+  preferences.putShort("humUL", humidityConfig.upperLimit);
+  preferences.putBool("humULS", humidityConfig.upperLimitSet);
+  preferences.putShort("humLL", humidityConfig.lowerLimit);
+  preferences.putBool("humLLS", humidityConfig.lowerLimitSet);
+  
+  // Pressure limits
+  preferences.putShort("presUL", pressureConfig.upperLimit);
+  preferences.putBool("presULS", pressureConfig.upperLimitSet);
+  preferences.putShort("presLL", pressureConfig.lowerLimit);
+  preferences.putBool("presLLS", pressureConfig.lowerLimitSet);
+  
+  // AQI limits
+  preferences.putShort("aqiUL", aqiConfig.upperLimit);
+  preferences.putBool("aqiULS", aqiConfig.upperLimitSet);
+  preferences.putShort("aqiLL", aqiConfig.lowerLimit);
+  preferences.putBool("aqiLLS", aqiConfig.lowerLimitSet);
+  
+  preferences.end();
+  
+  Serial.println("[EEPROM] All settings saved");
+}
+
+// Load all settings from EEPROM
+void loadAllSettingsFromEEPROM() {
+  preferences.begin("settings", true);  // Read-only mode
+  
+  // Enable states
+  tempEnabled = preferences.getBool("tempEn", false);
+  humidityEnabled = preferences.getBool("humEn", false);
+  pressureEnabled = preferences.getBool("presEn", false);
+  aqiEnabled = preferences.getBool("aqiEn", false);
+  
+  // Units
+  tempUnit = (UnitType)preferences.getUChar("tempUnit", UNIT_F);
+  pressureUnit = (UnitType)preferences.getUChar("presUnit", UNIT_MMH2O);
+  
+  // Buzzer
+  buzzerEnabled = preferences.getBool("buzzerEn", true);
+  
+  // MODBUS Enable
+  modbusEnabled = preferences.getBool("modbusEn", true);
+  
+  // Calibration offsets
+  tempConfig.offset = preferences.getShort("tempOff", 0);
+  humidityConfig.offset = preferences.getShort("humOff", 0);
+  pressureConfig.offset = preferences.getShort("presOff", 0);
+  aqiConfig.offset = preferences.getShort("aqiOff", 0);
+  
+  // Temperature limits
+  tempConfig.upperLimit = preferences.getShort("tempUL", 0);
+  tempConfig.upperLimitSet = preferences.getBool("tempULS", false);
+  tempConfig.lowerLimit = preferences.getShort("tempLL", 0);
+  tempConfig.lowerLimitSet = preferences.getBool("tempLLS", false);
+  
+  // Humidity limits
+  humidityConfig.upperLimit = preferences.getShort("humUL", 0);
+  humidityConfig.upperLimitSet = preferences.getBool("humULS", false);
+  humidityConfig.lowerLimit = preferences.getShort("humLL", 0);
+  humidityConfig.lowerLimitSet = preferences.getBool("humLLS", false);
+  
+  // Pressure limits
+  pressureConfig.upperLimit = preferences.getShort("presUL", 0);
+  pressureConfig.upperLimitSet = preferences.getBool("presULS", false);
+  pressureConfig.lowerLimit = preferences.getShort("presLL", 0);
+  pressureConfig.lowerLimitSet = preferences.getBool("presLLS", false);
+  
+  // AQI limits
+  aqiConfig.upperLimit = preferences.getShort("aqiUL", 0);
+  aqiConfig.upperLimitSet = preferences.getBool("aqiULS", false);
+  aqiConfig.lowerLimit = preferences.getShort("aqiLL", 0);
+  aqiConfig.lowerLimitSet = preferences.getBool("aqiLLS", false);
+  
+  preferences.end();
+  
+  Serial.println("[EEPROM] All settings loaded");
+  Serial.printf("  Temp: %s, Unit: %d, Offset: %d\n", 
+                tempEnabled ? "ON" : "OFF", tempUnit, tempConfig.offset);
+  Serial.printf("  Humidity: %s, Offset: %d\n", 
+                humidityEnabled ? "ON" : "OFF", humidityConfig.offset);
+  Serial.printf("  Pressure: %s, Unit: %d, Offset: %d\n", 
+                pressureEnabled ? "ON" : "OFF", pressureUnit, pressureConfig.offset);
+  Serial.printf("  AQI: %s, Offset: %d\n", 
+                aqiEnabled ? "ON" : "OFF", aqiConfig.offset);
+  Serial.printf("  Buzzer: %s, MODBUS: %s\n", 
+                buzzerEnabled ? "ON" : "OFF", modbusEnabled ? "ON" : "OFF");
+}
+
+// Sync all settings to DWIN display
+void syncSettingsToDwin() {
+  Serial.println("[DWIN] Syncing settings to display...");
+  
+  // Enable states (0=ON, 1=OFF for DWIN)
+  dwinSendVP_u16(0x5111, tempEnabled ? 0 : 1);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  dwinSendVP_u16(0x5131, humidityEnabled ? 0 : 1);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  dwinSendVP_u16(0x5121, pressureEnabled ? 0 : 1);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  dwinSendVP_u16(0x5141, aqiEnabled ? 0 : 1);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  
+  // Units
+  dwinSendVP_u16(0x5110, (tempUnit == UNIT_F) ? 0 : 1);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  dwinSendVP_u16(0x5120, (pressureUnit == UNIT_MMH2O) ? 0 : 1);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  
+  // Buzzer
+  dwinSendVP_u16(VP_BUZZER_SETTING, buzzerEnabled ? 0 : 1);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  
+  // MODBUS Enable
+  dwinSendVP_u16(VP_MODBUS_ENABLE, modbusEnabled ? 0 : 1);
+  vTaskDelay(pdMS_TO_TICKS(20));
+
+  // Username
+  sendUsernameToDwin();
+  
+  // Helper function to send offset/limit as ASCII
+  auto sendAsciiValue = [](uint16_t vp, int16_t value, bool isSet) {
+    uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    if (isSet || value != 0) {
+      char str[8];
+      snprintf(str, sizeof(str), "%d", value);
+      size_t len = strlen(str);
+      if (len > 4) len = 4;
+      memcpy(dataBytes, str, len);
+    } else {
+      // Send "-" for unset limits
+      dataBytes[0] = '-';
+    }
+    dwinSendVP(vp, dataBytes, 4);
+    vTaskDelay(pdMS_TO_TICKS(20));
+  };
+  
+  // Helper for offsets (always show value)
+  auto sendOffsetValue = [](uint16_t vp, int16_t value) {
+    uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    char str[8];
+    snprintf(str, sizeof(str), "%d", value);
+    size_t len = strlen(str);
+    if (len > 4) len = 4;
+    memcpy(dataBytes, str, len);
+    dwinSendVP(vp, dataBytes, 4);
+    vTaskDelay(pdMS_TO_TICKS(20));
+  };
+  
+  // Calibration offsets
+  sendOffsetValue(VP_TEMP_CALIBRATION, tempConfig.offset);
+  sendOffsetValue(VP_HUMIDITY_CALIBRATION, humidityConfig.offset);
+  sendOffsetValue(VP_PRESSURE_CALIBRATION, pressureConfig.offset);
+  sendOffsetValue(VP_AQI_CALIBRATION, aqiConfig.offset);
+  
+  // Upper limits
+  sendAsciiValue(VP_TEMP_UPPER_LIMIT, tempConfig.upperLimit, tempConfig.upperLimitSet);
+  sendAsciiValue(VP_HUMIDITY_UPPER_LIMIT, humidityConfig.upperLimit, humidityConfig.upperLimitSet);
+  sendAsciiValue(VP_PRESSURE_UPPER_LIMIT, pressureConfig.upperLimit, pressureConfig.upperLimitSet);
+  sendAsciiValue(VP_AQI_UPPER_LIMIT, aqiConfig.upperLimit, aqiConfig.upperLimitSet);
+  
+  // Lower limits
+  sendAsciiValue(VP_TEMP_LOWER_LIMIT, tempConfig.lowerLimit, tempConfig.lowerLimitSet);
+  sendAsciiValue(VP_HUMIDITY_LOWER_LIMIT, humidityConfig.lowerLimit, humidityConfig.lowerLimitSet);
+  sendAsciiValue(VP_PRESSURE_LOWER_LIMIT, pressureConfig.lowerLimit, pressureConfig.lowerLimitSet);
+  sendAsciiValue(VP_AQI_LOWER_LIMIT, aqiConfig.lowerLimit, aqiConfig.lowerLimitSet);
+  
+  // MODBUS settings (as ASCII)
+  {
+    char str[8];
+    uint8_t dataBytes[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    
+    // Slave ID
+    snprintf(str, sizeof(str), "%d", modbusSlaveId);
+    size_t len = strlen(str);
+    if (len > 4) len = 4;
+    memcpy(dataBytes, str, len);
+    dwinSendVP(VP_MODBUS_SLAVE_ID, dataBytes, 4);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    
+    // Baud Rate (need more bytes)
+    uint8_t baudBytes[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    snprintf(str, sizeof(str), "%lu", modbusBaudRate);
+    len = strlen(str);
+    if (len > 8) len = 8;
+    memcpy(baudBytes, str, len);
+    dwinSendVP(VP_MODBUS_BAUD_RATE, baudBytes, 8);
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  
+  Serial.println("[DWIN] Settings synced to display");
+}
+
+// Factory reset - clear all settings and restart
+void factoryReset() {
+  Serial.println("[RESET] Factory reset initiated...");
+  
+  // Clear all namespaces
+  preferences.begin("settings", false);
+  preferences.clear();
+  preferences.end();
+  
+  preferences.begin("modbus", false);
+  preferences.clear();
+  preferences.end();
+  
+  Serial.println("[RESET] EEPROM cleared");
+  Serial.println("[RESET] Restarting ESP32...");
+  
+  delay(1000);
+  ESP.restart();
+}
+
 /* -------------------- MODBUS CALLBACK FUNCTIONS -------------------- */
 
 // Callback when Holding Register is written by MODBUS master
@@ -831,6 +1134,7 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
       // Sync to DWIN display
       dwinSendVP_u16(0x5111, val);
       refreshDashboard();
+      saveAllSettingsToEEPROM();
       Serial.printf("[MODBUS] Temperature %s\n", tempEnabled ? "ENABLED" : "DISABLED");
       break;
 
@@ -838,6 +1142,7 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
       humidityEnabled = (val == 0);
       dwinSendVP_u16(0x5131, val);
       refreshDashboard();
+      saveAllSettingsToEEPROM();
       Serial.printf("[MODBUS] Humidity %s\n", humidityEnabled ? "ENABLED" : "DISABLED");
       break;
 
@@ -845,6 +1150,7 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
       pressureEnabled = (val == 0);
       dwinSendVP_u16(0x5121, val);
       refreshDashboard();
+      saveAllSettingsToEEPROM();
       Serial.printf("[MODBUS] Pressure %s\n", pressureEnabled ? "ENABLED" : "DISABLED");
       break;
 
@@ -852,6 +1158,7 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
       aqiEnabled = (val == 0);
       dwinSendVP_u16(0x5141, val);
       refreshDashboard();
+      saveAllSettingsToEEPROM();
       Serial.printf("[MODBUS] AQI %s\n", aqiEnabled ? "ENABLED" : "DISABLED");
       break;
 
@@ -867,6 +1174,7 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
         memcpy(dataBytes, offsetStr, len);
         dwinSendVP(VP_TEMP_CALIBRATION, dataBytes, 4);
       }
+      saveAllSettingsToEEPROM();
       Serial.printf("[MODBUS] Temp offset set to: %d\n", tempConfig.offset);
       break;
 
@@ -881,6 +1189,7 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
         memcpy(dataBytes, offsetStr, len);
         dwinSendVP(VP_HUMIDITY_CALIBRATION, dataBytes, 4);
       }
+      saveAllSettingsToEEPROM();
       Serial.printf("[MODBUS] Humidity offset set to: %d\n", humidityConfig.offset);
       break;
 
@@ -895,6 +1204,7 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
         memcpy(dataBytes, offsetStr, len);
         dwinSendVP(VP_PRESSURE_CALIBRATION, dataBytes, 4);
       }
+      saveAllSettingsToEEPROM();
       Serial.printf("[MODBUS] Pressure offset set to: %d\n", pressureConfig.offset);
       break;
 
@@ -909,6 +1219,7 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
         memcpy(dataBytes, offsetStr, len);
         dwinSendVP(VP_AQI_CALIBRATION, dataBytes, 4);
       }
+      saveAllSettingsToEEPROM();
       Serial.printf("[MODBUS] AQI offset set to: %d\n", aqiConfig.offset);
       break;
 
@@ -1147,31 +1458,38 @@ void handleIntVP(uint16_t vp, uint16_t value) {
   Serial.printf("INT  VP 0x%04X = %d\n", vp, value);
 
   bool changed = false;
+  bool needsSave = false;
 
   switch (vp) {
     case 0x5110:  // Temp unit
       tempUnit = (value == 0) ? UNIT_F : UNIT_C;
       changed = true;
+      needsSave = true;
       break;
     case 0x5111:  // Temp enable
       tempEnabled = (value == 0);
       changed = true;
+      needsSave = true;
       break;
     case 0x5120:  // Pressure unit
       pressureUnit = (value == 0) ? UNIT_MMH2O : UNIT_PA;
       changed = true;
+      needsSave = true;
       break;
     case 0x5121:  // Pressure enable
       pressureEnabled = (value == 0);
       changed = true;
+      needsSave = true;
       break;
     case 0x5131:  // Humidity enable
       humidityEnabled = (value == 0);
       changed = true;
+      needsSave = true;
       break;
     case 0x5141:  // AQI enable
       aqiEnabled = (value == 0);
       changed = true;
+      needsSave = true;
       break;
     
     // Alarm Acknowledge Button
@@ -1184,17 +1502,23 @@ void handleIntVP(uint16_t vp, uint16_t value) {
     case VP_BUZZER_SETTING:
       buzzerEnabled = (value == 0);
       Serial.printf("[BUZZER] Alarm sound %s\n", buzzerEnabled ? "ON" : "OFF");
+      needsSave = true;
       break;
 
     // MODBUS Enable/Disable
     case VP_MODBUS_ENABLE:
       modbusEnabled = (value == 0);
       Serial.printf("[MODBUS] %s\n", modbusEnabled ? "ENABLED" : "DISABLED");
+      needsSave = true;
       break;
   }
 
   if (changed) {
     refreshDashboard();
+  }
+  
+  if (needsSave) {
+    saveAllSettingsToEEPROM();
   }
 }
 
@@ -1327,6 +1651,31 @@ void handleStringVP(uint16_t vp, const char *text) {
         Serial.printf("  -> Baud Rate set to: %lu\n", baudRate);
       }
       return;
+    
+    // -------- Factory Reset --------
+    case VP_FACTORY_RESET:
+      Serial.printf("  -> Factory reset command received: %s\n", text);
+      if (strcmp(text, "RESET") == 0) {
+        Serial.println("  -> RESET confirmed! Performing factory reset...");
+        factoryReset();
+      } else {
+        Serial.println("  -> Invalid reset command. Send 'RESET' to confirm.");
+      }
+      return;
+
+    // -------- Username --------
+    case VP_USERNAME:
+      Serial.printf("  -> Username received: %s\n", text);
+      if (strlen(text) > 0 && strlen(text) <= USERNAME_MAX_LENGTH) {
+        saveUsernameToEEPROM(text);
+        Serial.printf("  -> Username updated to: %s\n", username);
+      } else if (strlen(text) == 0) {
+        saveUsernameToEEPROM(DEFAULT_USERNAME);
+        Serial.println("  -> Empty username, reset to default");
+      } else {
+        Serial.println("  -> Username too long, not saved");
+      }
+      return;
   }
 
   // Handle other string VPs (calibration & limits)
@@ -1339,21 +1688,25 @@ void handleStringVP(uint16_t vp, const char *text) {
       tempConfig.offset = validNum ? value : 0;
       Serial.printf("  -> Temp calibration offset: %d (valid: %s)\n", 
                     tempConfig.offset, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_HUMIDITY_CALIBRATION:
       humidityConfig.offset = validNum ? value : 0;
       Serial.printf("  -> Humidity calibration offset: %d (valid: %s)\n", 
                     humidityConfig.offset, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_PRESSURE_CALIBRATION:
       pressureConfig.offset = validNum ? value : 0;
       Serial.printf("  -> Pressure calibration offset: %d (valid: %s)\n", 
                     pressureConfig.offset, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_AQI_CALIBRATION:
       aqiConfig.offset = validNum ? value : 0;
       Serial.printf("  -> AQI calibration offset: %d (valid: %s)\n", 
                     aqiConfig.offset, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
 
     // -------- Upper Limit VPs --------
@@ -1362,24 +1715,28 @@ void handleStringVP(uint16_t vp, const char *text) {
       tempConfig.upperLimit = validNum ? value : 0;
       Serial.printf("  -> Temp upper limit: %d (set: %s)\n", 
                     tempConfig.upperLimit, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_HUMIDITY_UPPER_LIMIT:
       humidityConfig.upperLimitSet = validNum;
       humidityConfig.upperLimit = validNum ? value : 0;
       Serial.printf("  -> Humidity upper limit: %d (set: %s)\n", 
                     humidityConfig.upperLimit, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_PRESSURE_UPPER_LIMIT:
       pressureConfig.upperLimitSet = validNum;
       pressureConfig.upperLimit = validNum ? value : 0;
       Serial.printf("  -> Pressure upper limit: %d (set: %s)\n", 
                     pressureConfig.upperLimit, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_AQI_UPPER_LIMIT:
       aqiConfig.upperLimitSet = validNum;
       aqiConfig.upperLimit = validNum ? value : 0;
       Serial.printf("  -> AQI upper limit: %d (set: %s)\n", 
                     aqiConfig.upperLimit, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
 
     // -------- Lower Limit VPs --------
@@ -1388,24 +1745,28 @@ void handleStringVP(uint16_t vp, const char *text) {
       tempConfig.lowerLimit = validNum ? value : 0;
       Serial.printf("  -> Temp lower limit: %d (set: %s)\n", 
                     tempConfig.lowerLimit, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_HUMIDITY_LOWER_LIMIT:
       humidityConfig.lowerLimitSet = validNum;
       humidityConfig.lowerLimit = validNum ? value : 0;
       Serial.printf("  -> Humidity lower limit: %d (set: %s)\n", 
                     humidityConfig.lowerLimit, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_PRESSURE_LOWER_LIMIT:
       pressureConfig.lowerLimitSet = validNum;
       pressureConfig.lowerLimit = validNum ? value : 0;
       Serial.printf("  -> Pressure lower limit: %d (set: %s)\n", 
                     pressureConfig.lowerLimit, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
     case VP_AQI_LOWER_LIMIT:
       aqiConfig.lowerLimitSet = validNum;
       aqiConfig.lowerLimit = validNum ? value : 0;
       Serial.printf("  -> AQI lower limit: %d (set: %s)\n", 
                     aqiConfig.lowerLimit, validNum ? "yes" : "no");
+      saveAllSettingsToEEPROM();
       break;
 
     // -------- Data Display VPs (logging only) --------
@@ -1474,48 +1835,58 @@ void dwinRxTask(void *pvParameters) {
 }
 
 /* -------------------- READ CALIBRATION & LIMITS ON BOOT -------------------- */
-void readCalibrationAndLimitsFromDisplay() {
-  // Read Calibration Offsets (2 words = 4 bytes each)
-  dwinReadVP(VP_TEMP_CALIBRATION, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_HUMIDITY_CALIBRATION, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_PRESSURE_CALIBRATION, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_AQI_CALIBRATION, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
+// void readCalibrationAndLimitsFromDisplay() {
+//   // Read Calibration Offsets (2 words = 4 bytes each)
+//   dwinReadVP(VP_TEMP_CALIBRATION, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_HUMIDITY_CALIBRATION, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_PRESSURE_CALIBRATION, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_AQI_CALIBRATION, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
 
-  // Read Upper Limits (2 words = 4 bytes each)
-  dwinReadVP(VP_TEMP_UPPER_LIMIT, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_HUMIDITY_UPPER_LIMIT, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_PRESSURE_UPPER_LIMIT, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_AQI_UPPER_LIMIT, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
+//   // Read Upper Limits (2 words = 4 bytes each)
+//   dwinReadVP(VP_TEMP_UPPER_LIMIT, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_HUMIDITY_UPPER_LIMIT, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_PRESSURE_UPPER_LIMIT, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_AQI_UPPER_LIMIT, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
 
-  // Read Lower Limits (2 words = 4 bytes each)
-  dwinReadVP(VP_TEMP_LOWER_LIMIT, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_HUMIDITY_LOWER_LIMIT, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_PRESSURE_LOWER_LIMIT, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(VP_AQI_LOWER_LIMIT, 2);
-  vTaskDelay(pdMS_TO_TICKS(50));
-}
+//   // Read Lower Limits (2 words = 4 bytes each)
+//   dwinReadVP(VP_TEMP_LOWER_LIMIT, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_HUMIDITY_LOWER_LIMIT, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_PRESSURE_LOWER_LIMIT, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+//   dwinReadVP(VP_AQI_LOWER_LIMIT, 2);
+//   vTaskDelay(pdMS_TO_TICKS(50));
+// }
 
 /* -------------------- ARDUINO SETUP -------------------- */
 void setup() {
   Serial.begin(115200);
-  delay(3000);  // Wait for display to initialize
-  Serial.println("===========================================");
-  Serial.println("ESP32 + FreeRTOS + DWIN + Sensors");
-  Serial.println("===========================================");
+  Serial.println(F("==========================================="));
+  Serial.println(F("ESP32 + FreeRTOS + DWIN + Sensors"));
+  Serial.println(F("With Persistence & Factory Reset"));
+  Serial.println(F("==========================================="));
+  delay(DISPLAY_INIT_DELAY);  // Wait for display to initialize
 
   // Load password from EEPROM
   loadPasswordFromEEPROM();
+  
+  // Load all settings from EEPROM
+  loadAllSettingsFromEEPROM();
+  
+  // Load MODBUS settings from EEPROM
+  loadModbusSettingsFromEEPROM();
+
+  // Load username from EEPROM
+  loadUsernameFromEEPROM();
 
   Wire.begin(21, 22);  // SDA, SCL
 
@@ -1529,7 +1900,7 @@ void setup() {
 
   DWIN_UART.begin(DWIN_BAUD, SERIAL_8N1, DWIN_RX_PIN, DWIN_TX_PIN);
   Serial.println("[OK] DWIN UART initialized");
-
+  
   dwinUartMutex = xSemaphoreCreateMutex();
   if (dwinUartMutex == NULL) {
     Serial.println("[FATAL] Failed to create DWIN UART mutex");
@@ -1544,31 +1915,18 @@ void setup() {
   }
   Serial.println("[OK] RTC mutex created");
 
+  // Sync all settings to DWIN display
+  syncSettingsToDwin();
+  
+  // Initialize dashboard with loaded settings
+  refreshDashboard();
+
   // Create FreeRTOS tasks
   xTaskCreate(dwinRxTask, "DWIN_RX", 4096, NULL, 2, NULL);
   xTaskCreate(dwinDataRefreshTask, "DWIN_REFRESH", 4096, NULL, 2, NULL);
   xTaskCreate(alarmBlinkTask, "ALARM_BLINK", 2048, NULL, 1, NULL);
   xTaskCreate(rtcTask, "RTC_TASK", 2048, NULL, 1, NULL);
   Serial.println("[OK] FreeRTOS tasks created");
-
-  // Initial state sync - Settings VPs
-  Serial.println("Reading settings VPs...");
-  dwinReadVP(0x5110, 1);  // Temp unit
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(0x5111, 1);  // Temp enable
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(0x5120, 1);  // Pressure unit
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(0x5121, 1);  // Pressure enable
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(0x5131, 1);  // Humidity enable
-  vTaskDelay(pdMS_TO_TICKS(50));
-  dwinReadVP(0x5141, 1);  // AQI enable
-  vTaskDelay(pdMS_TO_TICKS(50));
-
-  // Read calibration and limits from display
-  Serial.println("Reading calibration & limits VPs...");
-  readCalibrationAndLimitsFromDisplay();
 
   // Send initial date/time to display
   Serial.println("Initializing RTC...");
@@ -1577,9 +1935,6 @@ void setup() {
                 rtcHour, rtcMinute, rtcSecond);
   dwinUpdateRTC();
 
-  // Load MODBUS settings from EEPROM
-  loadModbusSettingsFromEEPROM();
-
   // Initialize MODBUS
   initModbus();
 
@@ -1587,12 +1942,13 @@ void setup() {
   xTaskCreate(modbusTask, "MODBUS_TASK", 4096, NULL, 1, NULL);
   Serial.println("[OK] MODBUS task created");
 
-  // Log default buzzer setting
-  Serial.printf("[BUZZER] Default: Alarm sound %s\n", buzzerEnabled ? "ON" : "OFF");
+  // Log settings
+  Serial.printf("[BUZZER] Alarm sound %s\n", buzzerEnabled ? "ON" : "OFF");
+  Serial.printf("[MODBUS] %s\n", modbusEnabled ? "ENABLED" : "DISABLED");
 
-  Serial.println("===========================================");
-  Serial.println("Setup complete! System running.");
-  Serial.println("===========================================");
+  Serial.println(F("==========================================="));
+  Serial.println(F("Setup complete! System running."));
+  Serial.println(F("==========================================="));
 }
 
 /* -------------------- ARDUINO LOOP -------------------- */
