@@ -53,6 +53,18 @@
 
 #define DWIN_MAX_FRAME 256
 
+/* -------------------- PRESSURE SENSOR CONFIG -------------------- */
+#define PRESSURE_SENSOR_ADDR    0x6D
+#define PRESSURE_REG_CMD        0x30
+#define PRESSURE_REG_PRESS_MSB  0x06
+#define PRESSURE_CMD_CONVERT    0x0A
+#define PRESSURE_K_FACTOR       32.0f
+
+// Conversion constants
+#define PA_TO_KPA               0.001f
+#define PA_TO_MMH2O             0.10197f  // 1 Pa = 0.10197 mmH2O
+bool pressure_ok = false;
+
 /* -------------------- MODBUS GLOBALS -------------------- */
 SoftwareSerial modbusSerial(MODBUS_RX_PIN, MODBUS_TX_PIN);
 ModbusRTU mb;
@@ -135,6 +147,7 @@ char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
 // Page IDs
 #define PAGE_SETTINGS          0x01
 #define PAGE_ADVANCED_SETTINGS 0x0A
+#define PAGE_DASHBOARD         0x08
 
 /* -------------------- VP ADDRESSES -------------------- */
 // DWIN RTC Register
@@ -190,6 +203,9 @@ char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
 
 // Username (stored in EEPROM)
 char username[USERNAME_MAX_LENGTH + 1] = DEFAULT_USERNAME;
+
+// Flag to track if page was switched (to trigger refresh)
+bool pageSwitched = false;
 
 /* -------------------- VP TYPE MAP -------------------- */
 vp_type_t getVpType(uint16_t vp) {
@@ -539,6 +555,11 @@ void rtcTask(void *pvParameters) {
       Serial.printf("[RTC] %02d/%02d/%04d %02d:%02d:%02d\n", 
                     rtcDay, rtcMonth, 2000 + rtcYear, 
                     rtcHour, rtcMinute, rtcSecond);
+      // Navigate to dashboard page in every 2 minutes
+      if(pageSwitched){
+        dwinSwitchPage(PAGE_DASHBOARD);
+        pageSwitched = false;
+      }else pageSwitched++;
     }
     
     vTaskDelay(pdMS_TO_TICKS(1000));  // 1 second delay
@@ -641,8 +662,8 @@ typedef enum {
   UNIT_F = 0,
   UNIT_C = 1,
   UNIT_MMH2O = 2,
-  UNIT_RH = 3,
-  UNIT_PA = 4,
+  UNIT_RH = 4,
+  UNIT_PA = 3,
   UNIT_BLANK = 5
 } UnitType;
 
@@ -1235,6 +1256,85 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
   return val;
 }
 
+/* -------------------- PRESSURE SENSOR FUNCTIONS -------------------- */
+
+// Initialize pressure sensor (check if present)
+bool initPressureSensor() {
+  Wire.beginTransmission(PRESSURE_SENSOR_ADDR);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error == 0) {
+    Serial.println("[OK] XGZP6897D pressure sensor found");
+    return true;
+  } else {
+    Serial.println("[ERROR] XGZP6897D pressure sensor not found");
+    return false;
+  }
+}
+
+// Read pressure from sensor (returns value in Pa, or NAN on error)
+float readPressurePa() {
+  // Step 1: Trigger conversion
+  Wire.beginTransmission(PRESSURE_SENSOR_ADDR);
+  Wire.write(PRESSURE_REG_CMD);
+  Wire.write(PRESSURE_CMD_CONVERT);
+  uint8_t error = Wire.endTransmission();
+  
+  if (error != 0) {
+    Serial.println("[PRESSURE] I2C write error");
+    return NAN;
+  }
+  
+  // Step 2: Wait for conversion (~20ms)
+  delay(20);
+  
+  // Step 3: Read 3 bytes (pressure only: MSB, CSB, LSB)
+  Wire.beginTransmission(PRESSURE_SENSOR_ADDR);
+  Wire.write(PRESSURE_REG_PRESS_MSB);
+  Wire.endTransmission(false);  // Repeated start
+  Wire.requestFrom((uint8_t)PRESSURE_SENSOR_ADDR, (uint8_t)3);
+  
+  if (Wire.available() < 3) {
+    Serial.println("[PRESSURE] I2C read error");
+    return NAN;
+  }
+  
+  uint8_t p_msb = Wire.read();
+  uint8_t p_csb = Wire.read();
+  uint8_t p_lsb = Wire.read();
+  
+  // Step 4: Combine into 24-bit value
+  uint32_t pressure_raw = ((uint32_t)p_msb << 16) | ((uint32_t)p_csb << 8) | p_lsb;
+  
+  // Step 5: Convert to signed Pa (24-bit signed)
+  float pressure_pa;
+  if (pressure_raw > 8388607) {  // 2^23 - 1 (sign bit set = negative)
+    pressure_pa = ((int32_t)(pressure_raw - 16777216)) / PRESSURE_K_FACTOR;
+  } else {
+    pressure_pa = (int32_t)pressure_raw / PRESSURE_K_FACTOR;
+  }
+  
+  return pressure_pa;
+}
+
+// Convert Pa to display unit and apply offset
+int convertPressureToDisplayUnit(float pressure_pa) {
+  int pressure_int;
+  
+  if (pressureUnit == UNIT_MMH2O) {
+    // Convert Pa to mmH2O
+    pressure_int = (int)round(pressure_pa * PA_TO_MMH2O);
+  } else {
+    // Convert Pa to kPa (UNIT_PA is used for kPa display)
+    pressure_int = (int)round(pressure_pa * PA_TO_KPA);
+  }
+  
+  // Apply calibration offset after conversion
+  pressure_int = pressure_int + pressureConfig.offset;
+  
+  return pressure_int;
+}
+
 /* -------------------- MODBUS INITIALIZATION -------------------- */
 void initModbus() {
   Serial.println("[MODBUS] Initializing...");
@@ -1320,9 +1420,9 @@ void updateModbusInputRegisters() {
     mb.Ireg(IREG_AQI_VALUE, (uint16_t)MODBUS_DISABLED_VALUE);
   }
 
-  // Units (0=°F/mmH₂O, 1=°C/Pa)
+  // Units (0=°F/mmH₂O, 1=°C/kPa)
   mb.Ireg(IREG_TEMP_UNIT, (tempUnit == UNIT_C) ? 1 : 0);
-  mb.Ireg(IREG_PRESSURE_UNIT, (pressureUnit == UNIT_PA) ? 1 : 0);
+  mb.Ireg(IREG_PRESSURE_UNIT, (pressureUnit == UNIT_PA) ? 1 : 0);  // 0=mmH2O, 1=kPa
 }
 
 /* -------------------- MODBUS TASK -------------------- */
@@ -1350,28 +1450,27 @@ void dwinDataRefreshTask(void *pvParameters) {
     String temp_str = "NaN";
     String hum_str  = "NaN";
     String aqi_str  = "NaN";
-    String pres_str = "NaN";  // No pressure sensor
+    String pres_str = "NaN";
 
     // Reset data valid flags
     tempConfig.dataValid = false;
     humidityConfig.dataValid = false;
-    pressureConfig.dataValid = false;  // No sensor, always false
+    pressureConfig.dataValid = false;
     aqiConfig.dataValid = false;
 
     float t = NAN, h = NAN;
 
+    // -------- SHT31: Temperature & Humidity --------
     if (sht31_ok) {
       t = sht31.readTemperature();
       h = sht31.readHumidity();
       
       // Temperature
       if (!isnan(t)) {
-        // Unit conversion first, then apply offset
         int temp_int = round(t);
         if (tempUnit == UNIT_F) {
           temp_int = round(t * 1.8f + 32.0f);
         }
-        // Apply calibration offset after unit conversion
         temp_int = temp_int + tempConfig.offset;
         currentTempValue = temp_int;
         temp_str = String(temp_int);
@@ -1388,21 +1487,28 @@ void dwinDataRefreshTask(void *pvParameters) {
       }
     }
 
-    // AQI (VOC Index) - only if temp/hum valid and SGP40 ok
+    // -------- SGP40: AQI (VOC Index) --------
     if (!isnan(t) && !isnan(h) && sgp_ok) {
       int32_t voc = sgp.measureVocIndex(t, h);
-      // Apply calibration offset
       int aqi_int = voc + aqiConfig.offset;
       currentAqiValue = aqi_int;
       aqi_str = String(aqi_int);
       aqiConfig.dataValid = true;
     }
 
-    // Pressure - No sensor integrated, always NaN
-    // pressureConfig.dataValid remains false
-    // pres_str remains "NaN"
+    // -------- XGZP6897D: Pressure --------
+    if (pressure_ok) {
+      float pressure_pa = readPressurePa();
+      
+      if (!isnan(pressure_pa)) {
+        int pres_int = convertPressureToDisplayUnit(pressure_pa);
+        currentPressureValue = pres_int;
+        pres_str = String(pres_int);
+        pressureConfig.dataValid = true;
+      }
+    }
 
-    // Check alarms for each parameter (also resets acknowledged flag when back in limits)
+    // Check alarms for each parameter
     tempConfig.alarmActive = checkAlarmCondition(currentTempValue, &tempConfig);
     humidityConfig.alarmActive = checkAlarmCondition(currentHumidityValue, &humidityConfig);
     pressureConfig.alarmActive = checkAlarmCondition(currentPressureValue, &pressureConfig);
@@ -1897,6 +2003,8 @@ void setup() {
   sgp_ok = sgp.begin();
   if (!sgp_ok) Serial.println("[ERROR] SGP40 not found");
   else Serial.println("[OK] SGP40 initialized");
+
+  pressure_ok = initPressureSensor();
 
   DWIN_UART.begin(DWIN_BAUD, SERIAL_8N1, DWIN_RX_PIN, DWIN_TX_PIN);
   Serial.println("[OK] DWIN UART initialized");
