@@ -54,11 +54,15 @@
 #define DWIN_MAX_FRAME 256
 
 /* -------------------- PRESSURE SENSOR CONFIG -------------------- */
-#define PRESSURE_SENSOR_ADDR    0x6D
-#define PRESSURE_REG_CMD        0x30
-#define PRESSURE_REG_PRESS_MSB  0x06
+#define PRESSURE_SENSOR_ADDR    0x58
+#define PRESSURE_REG_CMD        0x00
 #define PRESSURE_CMD_CONVERT    0x0A
-#define PRESSURE_K_FACTOR       32.0f
+#define PRESSURE_REG_PRESS_MSB  0x04
+#define PMAX 500.0               // Upper Limit
+#define PMIN -500.0              // Lower Limit
+#define FULL_SPAN (PMAX - PMIN)  // 1000 Pa
+#define DIVISOR_EXPONENT 21  // Change to 24 if values are off by factor of 8
+#define DIVISOR pow(2.0, DIVISOR_EXPONENT)
 
 // Conversion constants
 #define PA_TO_KPA               0.001f
@@ -1292,7 +1296,7 @@ float readPressurePa() {
   Wire.beginTransmission(PRESSURE_SENSOR_ADDR);
   Wire.write(PRESSURE_REG_PRESS_MSB);
   Wire.endTransmission(false);  // Repeated start
-  Wire.requestFrom((uint8_t)PRESSURE_SENSOR_ADDR, (uint8_t)3);
+  Wire.requestFrom((uint8_t)PRESSURE_SENSOR_ADDR, (uint8_t)5);
   
   if (Wire.available() < 3) {
     Serial.println("[PRESSURE] I2C read error");
@@ -1309,9 +1313,9 @@ float readPressurePa() {
   // Step 5: Convert to signed Pa (24-bit signed)
   float pressure_pa;
   if (pressure_raw > 8388607) {  // 2^23 - 1 (sign bit set = negative)
-    pressure_pa = ((int32_t)(pressure_raw - 16777216)) / PRESSURE_K_FACTOR;
+    pressure_pa = ((int32_t)(pressure_raw - 16777216)) / DIVISOR * FULL_SPAN;
   } else {
-    pressure_pa = (int32_t)pressure_raw / PRESSURE_K_FACTOR;
+    pressure_pa = (int32_t)pressure_raw / DIVISOR * FULL_SPAN;
   }
   
   return pressure_pa;
@@ -1324,10 +1328,11 @@ int convertPressureToDisplayUnit(float pressure_pa) {
   if (pressureUnit == UNIT_MMH2O) {
     // Convert Pa to mmH2O
     pressure_int = (int)round(pressure_pa * PA_TO_MMH2O);
-  } else {
+  } 
+  // else {
     // Convert Pa to kPa (UNIT_PA is used for kPa display)
-    pressure_int = (int)round(pressure_pa * PA_TO_KPA);
-  }
+    // pressure_int = (int)round(pressure_pa * PA_TO_KPA);
+  // }
   
   // Apply calibration offset after conversion
   pressure_int = pressure_int + pressureConfig.offset;
@@ -1555,7 +1560,7 @@ void dwinDataRefreshTask(void *pvParameters) {
       modbusInternalWrite = false;  // Clear flag
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
