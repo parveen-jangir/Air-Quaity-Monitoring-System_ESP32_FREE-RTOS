@@ -1265,6 +1265,8 @@ uint16_t modbusOnHregSet(TRegister* reg, uint16_t val) {
 // Initialize pressure sensor (check if present)
 bool initPressureSensor() {
   Wire.beginTransmission(PRESSURE_SENSOR_ADDR);
+  Wire.write(PRESSURE_REG_CMD);
+  Wire.write(PRESSURE_CMD_CONVERT);
   uint8_t error = Wire.endTransmission();
   
   if (error == 0) {
@@ -1296,16 +1298,16 @@ float readPressurePa() {
   Wire.beginTransmission(PRESSURE_SENSOR_ADDR);
   Wire.write(PRESSURE_REG_PRESS_MSB);
   Wire.endTransmission(false);  // Repeated start
-  Wire.requestFrom((uint8_t)PRESSURE_SENSOR_ADDR, (uint8_t)5);
+  Wire.requestFrom((uint8_t)PRESSURE_SENSOR_ADDR, (uint8_t)3);
   
   if (Wire.available() < 3) {
     Serial.println("[PRESSURE] I2C read error");
     return NAN;
   }
   
-  uint8_t p_msb = Wire.read();
-  uint8_t p_csb = Wire.read();
-  uint8_t p_lsb = Wire.read();
+  uint8_t p_msb = Wire.read();  //0x04
+  uint8_t p_csb = Wire.read();  //0x05
+  uint8_t p_lsb = Wire.read();  //0x06  
   
   // Step 4: Combine into 24-bit value
   uint32_t pressure_raw = ((uint32_t)p_msb << 16) | ((uint32_t)p_csb << 8) | p_lsb;
@@ -1317,6 +1319,7 @@ float readPressurePa() {
   } else {
     pressure_pa = (int32_t)pressure_raw / DIVISOR * FULL_SPAN;
   }
+  Serial.printf("pressure: %f", pressure_pa);
   
   return pressure_pa;
 }
@@ -1329,10 +1332,10 @@ int convertPressureToDisplayUnit(float pressure_pa) {
     // Convert Pa to mmH2O
     pressure_int = (int)round(pressure_pa * PA_TO_MMH2O);
   } 
-  // else {
-    // Convert Pa to kPa (UNIT_PA is used for kPa display)
-    // pressure_int = (int)round(pressure_pa * PA_TO_KPA);
-  // }
+  else {
+    // Convert Pa to Pa (no conversion, but round to nearest integer)
+    pressure_int = (int)round(pressure_pa);
+  }
   
   // Apply calibration offset after conversion
   pressure_int = pressure_int + pressureConfig.offset;
@@ -1508,6 +1511,7 @@ void dwinDataRefreshTask(void *pvParameters) {
       if (!isnan(pressure_pa)) {
         int pres_int = convertPressureToDisplayUnit(pressure_pa);
         currentPressureValue = pres_int;
+        Serial.printf("current pressure value: %d\n", currentPressureValue);
         pres_str = String(pres_int);
         pressureConfig.dataValid = true;
       }
