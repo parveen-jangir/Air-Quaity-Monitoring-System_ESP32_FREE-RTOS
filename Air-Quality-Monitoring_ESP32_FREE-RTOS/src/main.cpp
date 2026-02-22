@@ -222,6 +222,24 @@ char username[USERNAME_MAX_LENGTH + 1] = DEFAULT_USERNAME;
 // Flag to track if page was switched (to trigger refresh)
 bool pageSwitched = false;
 
+// Acknowledgement Push button variable
+#define BUTTON_ACK_PIN          18
+#define BUTTON_DEBOUNCE_MS      100
+
+volatile bool alarmAckButtonPressed = false;
+volatile unsigned long lastButtonPressTime = 0;
+
+/* -------------------- BUTTON INTERRUPT SERVICE ROUTINE -------------------- */
+void IRAM_ATTR buttonAckISR() {
+  unsigned long currentTime = millis();
+  
+  // Debounce check
+  if (currentTime - lastButtonPressTime > BUTTON_DEBOUNCE_MS) {
+    alarmAckButtonPressed = true;
+    lastButtonPressTime = currentTime;
+  }
+}
+
 /* -------------------- VP TYPE MAP -------------------- */
 vp_type_t getVpType(uint16_t vp) {
   switch (vp) {
@@ -900,6 +918,13 @@ bool shouldShowAlarm(ParameterType param) {
 /* -------------------- ALARM BLINK TASK -------------------- */
 void alarmBlinkTask(void *pvParameters) {
   while (1) {
+    // Check if ACK button was pressed
+    if (alarmAckButtonPressed) {
+      alarmAckButtonPressed = false;  // Reset flag
+      acknowledgeAllAlarms();
+      Serial.println("[BUTTON] Alarm acknowledge button pressed");
+    }
+    
     // Toggle blink state
     alarmBlinkState = !alarmBlinkState;
     
@@ -2011,6 +2036,11 @@ void setup() {
   Serial.println(F("With Persistence & Factory Reset"));
   Serial.println(F("==========================================="));
   delay(DISPLAY_INIT_DELAY);  // Wait for display to initialize
+
+  // Initialize ACK button
+  pinMode(BUTTON_ACK_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_ACK_PIN), buttonAckISR, FALLING);
+  Serial.println("[OK] ACK button initialized on GPIO 18");
 
   // Load password from EEPROM
   loadPasswordFromEEPROM();
