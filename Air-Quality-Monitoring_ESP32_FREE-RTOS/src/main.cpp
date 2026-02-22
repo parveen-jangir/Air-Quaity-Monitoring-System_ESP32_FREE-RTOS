@@ -202,8 +202,13 @@ char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
 #define USERNAME_MAX_LENGTH     15
 #define DEFAULT_USERNAME        "Name"
 
-// Dismplay Initialization Delay (ms)
+// Display Initialization Delay (ms)
 #define DISPLAY_INIT_DELAY      2000
+
+// Display reset parameters
+#define VP_DISPLAY_RESET            0x0004
+#define DISPLAY_RESET_COMMAND       1437227685  // 0x55aa5aa5 = 1443722685 in decimal
+#define DISPLAY_RESET_CMD_LENGTH    4
 
 // Username (stored in EEPROM)
 char username[USERNAME_MAX_LENGTH + 1] = DEFAULT_USERNAME;
@@ -718,8 +723,8 @@ bool pressureEnabled = false;
 bool humidityEnabled = false;
 bool aqiEnabled = false;
 
-UnitType tempUnit = UNIT_F;         // Default °F
-UnitType pressureUnit = UNIT_MMH2O; // Default mm H₂O
+UnitType tempUnit = UNIT_C;         // Default °C
+UnitType pressureUnit = UNIT_PA; // Default Pa
 
 ParameterType shownInWidget[4] = {PARAM_BLANK, PARAM_BLANK, PARAM_BLANK, PARAM_BLANK};
 
@@ -964,8 +969,8 @@ void loadAllSettingsFromEEPROM() {
   aqiEnabled = preferences.getBool("aqiEn", false);
   
   // Units
-  tempUnit = (UnitType)preferences.getUChar("tempUnit", UNIT_F);
-  pressureUnit = (UnitType)preferences.getUChar("presUnit", UNIT_MMH2O);
+  tempUnit = (UnitType)preferences.getUChar("tempUnit", tempUnit);
+  pressureUnit = (UnitType)preferences.getUChar("presUnit", pressureUnit);
   
   // Buzzer
   buzzerEnabled = preferences.getBool("buzzerEn", true);
@@ -1122,6 +1127,13 @@ void syncSettingsToDwin() {
   Serial.println("[DWIN] Settings synced to display");
 }
 
+// Reset display CPU
+void resetDisplay() {
+  Serial.println("[DWIN] Resetting display...");
+  uint8_t resetCmd[4] = {0x55, 0xAA, 0x5A, 0xA5};  // Command to reset DWIN CPU
+  dwinSendVP(VP_DISPLAY_RESET, resetCmd, sizeof(resetCmd));
+}
+
 // Factory reset - clear all settings and restart
 void factoryReset() {
   Serial.println("[RESET] Factory reset initiated...");
@@ -1139,6 +1151,8 @@ void factoryReset() {
   Serial.println("[RESET] Restarting ESP32...");
   
   delay(1000);
+
+  resetDisplay();
   ESP.restart();
 }
 
@@ -1319,7 +1333,6 @@ float readPressurePa() {
   } else {
     pressure_pa = (int32_t)pressure_raw / DIVISOR * FULL_SPAN;
   }
-  Serial.printf("pressure: %f", pressure_pa);
   
   return pressure_pa;
 }
@@ -1511,7 +1524,6 @@ void dwinDataRefreshTask(void *pvParameters) {
       if (!isnan(pressure_pa)) {
         int pres_int = convertPressureToDisplayUnit(pressure_pa);
         currentPressureValue = pres_int;
-        Serial.printf("current pressure value: %d\n", currentPressureValue);
         pres_str = String(pres_int);
         pressureConfig.dataValid = true;
       }
@@ -1948,39 +1960,6 @@ void dwinRxTask(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
-
-/* -------------------- READ CALIBRATION & LIMITS ON BOOT -------------------- */
-// void readCalibrationAndLimitsFromDisplay() {
-//   // Read Calibration Offsets (2 words = 4 bytes each)
-//   dwinReadVP(VP_TEMP_CALIBRATION, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_HUMIDITY_CALIBRATION, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_PRESSURE_CALIBRATION, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_AQI_CALIBRATION, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-
-//   // Read Upper Limits (2 words = 4 bytes each)
-//   dwinReadVP(VP_TEMP_UPPER_LIMIT, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_HUMIDITY_UPPER_LIMIT, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_PRESSURE_UPPER_LIMIT, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_AQI_UPPER_LIMIT, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-
-//   // Read Lower Limits (2 words = 4 bytes each)
-//   dwinReadVP(VP_TEMP_LOWER_LIMIT, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_HUMIDITY_LOWER_LIMIT, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_PRESSURE_LOWER_LIMIT, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-//   dwinReadVP(VP_AQI_LOWER_LIMIT, 2);
-//   vTaskDelay(pdMS_TO_TICKS(50));
-// }
 
 /* -------------------- ARDUINO SETUP -------------------- */
 void setup() {
