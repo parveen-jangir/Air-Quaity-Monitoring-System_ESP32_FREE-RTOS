@@ -8,6 +8,7 @@
 #include "Adafruit_SGP40.h"
 #include <ModbusRTU.h>
 #include <SoftwareSerial.h>
+#include <uRTCLib.h>
 
 /* -------------------- MODBUS CONFIG -------------------- */
 #define MODBUS_TX_PIN     14
@@ -209,6 +210,11 @@ char settingsPassword[PASSWORD_LENGTH + 1] = DEFAULT_SETTINGS_PASSWORD;
 #define VP_DISPLAY_RESET            0x0004
 #define DISPLAY_RESET_COMMAND       1437227685  // 0x55aa5aa5 = 1443722685 in decimal
 #define DISPLAY_RESET_CMD_LENGTH    4
+
+// Parameters of RTC clock
+#define RTC_I2C_ADDRESS 0x68
+uRTCLib rtc(RTC_I2C_ADDRESS);
+bool rtcInit = false;
 
 // Username (stored in EEPROM)
 char username[USERNAME_MAX_LENGTH + 1] = DEFAULT_USERNAME;
@@ -512,6 +518,36 @@ bool parseTimeInput(const char *text) {
   return true;
 }
 
+// Refresh RTC varialbles
+void refreshRTC(){
+    if (xSemaphoreTake(rtcMutex, portMAX_DELAY) == pdTRUE) {
+      rtcYear = rtc.year();
+      rtcMonth = rtc.month();
+      rtcDay = rtc.day();
+      rtcHour = rtc.hour();
+      rtcMinute = rtc.minute();
+      rtcSecond = rtc.second();
+      xSemaphoreGive(rtcMutex);
+    }
+}
+
+// Initialize RTC DS3231
+bool initRTC() {
+  Wire.begin();
+  
+  // Check if RTC is responding
+  Wire.beginTransmission(RTC_I2C_ADDRESS);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[ERROR] DS3231 not found on I2C bus");
+    return false;
+  }
+
+  URTCLIB_WIRE.begin();
+
+  Serial.println("[OK] DS3231 RTC initialized successfully");
+  return true;
+}
+
 // Increment time by 1 second (called every second)
 void rtcTick() {
   if (xSemaphoreTake(rtcMutex, portMAX_DELAY) == pdTRUE) {
@@ -555,8 +591,8 @@ void rtcTick() {
 /* -------------------- RTC TASK -------------------- */
 void rtcTask(void *pvParameters) {
   while (1) {
-    // Tick every second
-    rtcTick();
+    
+    if(!rtcInit) rtcTick(); // Tick every second if RTC module not present (keep time in software)
     
     // Update display every minute (when seconds == 0)
     if (rtcSecond == 0) {
@@ -1529,6 +1565,12 @@ void dwinDataRefreshTask(void *pvParameters) {
       }
     }
 
+    // -------- DS3231: Time --------
+    if(rtcInit){
+      rtc.refresh();
+      refreshRTC();
+    }
+
     // Check alarms for each parameter
     tempConfig.alarmActive = checkAlarmCondition(currentTempValue, &tempConfig);
     humidityConfig.alarmActive = checkAlarmCondition(currentHumidityValue, &humidityConfig);
@@ -1576,7 +1618,7 @@ void dwinDataRefreshTask(void *pvParameters) {
       modbusInternalWrite = false;  // Clear flag
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(700));
   }
 }
 
@@ -1994,6 +2036,8 @@ void setup() {
 
   pressure_ok = initPressureSensor();
 
+  rtcInit = initRTC();
+
   DWIN_UART.begin(DWIN_BAUD, SERIAL_8N1, DWIN_RX_PIN, DWIN_TX_PIN);
   Serial.println("[OK] DWIN UART initialized");
   
@@ -2025,8 +2069,7 @@ void setup() {
   Serial.println("[OK] FreeRTOS tasks created");
 
   // Send initial date/time to display
-  Serial.println("Initializing RTC...");
-  Serial.printf("[RTC] Default: %02d/%02d/%04d %02d:%02d:%02d\n", 
+  Serial.printf("[RTC]: %02d/%02d/%04d %02d:%02d:%02d\n", 
                 rtcDay, rtcMonth, 2000 + rtcYear, 
                 rtcHour, rtcMinute, rtcSecond);
   dwinUpdateRTC();
