@@ -1409,6 +1409,9 @@ int convertPressureToDisplayUnit(float pressure_pa) {
   else {
     // Convert Pa to Pa (no conversion, but round to nearest integer)
     pressure_int = (int)round(pressure_pa);
+    if(pressure_int <= 1 && pressure_int >= -1) {
+      pressure_int = 0; // Treat very small values as zero to avoid noise
+    }
   }
   
   // Apply calibration offset after conversion
