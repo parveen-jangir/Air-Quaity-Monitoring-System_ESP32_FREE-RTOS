@@ -64,6 +64,7 @@
 #define FULL_SPAN (PMAX - PMIN)  // 1000 Pa
 #define DIVISOR_EXPONENT 21  // Change to 24 if values are off by factor of 8
 #define DIVISOR pow(2.0, DIVISOR_EXPONENT)
+#define NUM_SAMPLE_PA 20  // Number of samples to average for pressure reading
 
 // Conversion constants
 #define PA_TO_KPA               0.001f
@@ -1366,8 +1367,8 @@ float readPressurePa() {
     return NAN;
   }
   
-  // Step 2: Wait for conversion (~20ms)
-  delay(20);
+  // Step 2: Wait for conversion (~2ms)
+  delay(2);
   
   // Step 3: Read 3 bytes (pressure only: MSB, CSB, LSB)
   Wire.beginTransmission(PRESSURE_SENSOR_ADDR);
@@ -1583,8 +1584,20 @@ void dwinDataRefreshTask(void *pvParameters) {
 
     // -------- XGZP6897D: Pressure --------
     if (pressure_ok) {
-      float pressure_pa = readPressurePa();
-      
+
+      // Get multiple readings to average out noise
+      float pressure_raw[NUM_SAMPLE_PA] = {0};
+      for(int i = 0; i < NUM_SAMPLE_PA; i++) {
+        pressure_raw[i] = readPressurePa();
+        delay(3);  // Small delay between readings
+      }
+
+      float pressure_pa = 0;
+      for(int i = 0; i < NUM_SAMPLE_PA; i++) {
+        pressure_pa += pressure_raw[i];
+      }
+      pressure_pa /= NUM_SAMPLE_PA;
+
       if (!isnan(pressure_pa)) {
         int pres_int = convertPressureToDisplayUnit(pressure_pa);
         currentPressureValue = pres_int;
