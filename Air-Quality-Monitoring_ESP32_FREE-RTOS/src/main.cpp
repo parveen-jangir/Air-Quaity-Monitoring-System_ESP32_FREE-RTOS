@@ -1584,8 +1584,8 @@ void dwinDataRefreshTask(void *pvParameters) {
       t = sht31.readTemperature();
       h = sht31.readHumidity();
 
-      Serial.println("[SHT] Temperature: " + String(t, 2) + " °C");
-      
+      Serial.printf("[%02d:%02d][SHT] Temperature: %.2f °C\n", rtcMinute, rtcSecond, t);
+
       // Temperature
       if (!isnan(t)) {
         int temp_int = round(t);
@@ -1621,7 +1621,7 @@ void dwinDataRefreshTask(void *pvParameters) {
     if (pressure_ok) {
       // Get temperature from pressure sensor for compensation
       float pressure_temp = readTemperatureC();
-      Serial.printf("[PRESSURE] Temperature: %.2f °C\n", pressure_temp);
+      Serial.printf("[%02d:%02d][PRESSURE] Temperature: %.2f °C\n", rtcMinute, rtcSecond, pressure_temp);
 
       // Get multiple readings to average out noise
       float pressure_raw[NUM_SAMPLE_PA] = {0};
@@ -1649,7 +1649,7 @@ void dwinDataRefreshTask(void *pvParameters) {
       rtc.refresh();
       float tempC = rtc.temp();
       tempC /= 100;
-      Serial.println("[RTC] Temperature: " + String(tempC, 2) + " °C");
+      Serial.printf("[%02d:%02d][RTC] Temperature: %.2f °C\n", rtcMinute, rtcSecond, tempC);
       refreshRTC();
     }
 
