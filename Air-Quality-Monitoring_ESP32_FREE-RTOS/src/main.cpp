@@ -1399,6 +1399,39 @@ float readPressurePa() {
   return pressure_pa;
 }
 
+// Read temperature from sensor (returns value in °C, or NAN on error)
+float readTemperatureC() {
+
+  // Step 1: Read temperature registers 0x09 and 0x0A
+  Wire.beginTransmission(PRESSURE_SENSOR_ADDR);
+  Wire.write(0x09);                  // Temperature MSB
+  uint8_t error = Wire.endTransmission(false);  // Repeated start
+
+  if (error != 0) {
+    Serial.println("[TEMP] I2C write error");
+    return NAN;
+  }
+
+  // Step 2: Request 2 bytes
+  Wire.requestFrom((uint8_t)PRESSURE_SENSOR_ADDR, (uint8_t)2);
+
+  if (Wire.available() < 2) {
+    Serial.println("[TEMP] I2C read error");
+    return NAN;
+  }
+
+  uint8_t temp_msb = Wire.read();    // 0x09
+  uint8_t temp_lsb = Wire.read();    // 0x0A
+
+  // Step 3: Combine into signed 16-bit value
+  int16_t temp_raw = ((int16_t)temp_msb << 8) | temp_lsb;
+
+  // Step 4: Convert Q8.8 value to °C
+  float temperature_c = temp_raw / 256.0f;
+
+  return temperature_c;
+}
+
 // Convert Pa to display unit and apply offset
 int convertPressureToDisplayUnit(float pressure_pa) {
   int pressure_int;
@@ -1550,6 +1583,8 @@ void dwinDataRefreshTask(void *pvParameters) {
     if (sht31_ok) {
       t = sht31.readTemperature();
       h = sht31.readHumidity();
+
+      Serial.println("[SHT] Temperature: " + String(t, 2) + " °C");
       
       // Temperature
       if (!isnan(t)) {
@@ -1584,6 +1619,9 @@ void dwinDataRefreshTask(void *pvParameters) {
 
     // -------- XGZP6897D: Pressure --------
     if (pressure_ok) {
+      // Get temperature from pressure sensor for compensation
+      float pressure_temp = readTemperatureC();
+      Serial.printf("[PRESSURE] Temperature: %.2f °C\n", pressure_temp);
 
       // Get multiple readings to average out noise
       float pressure_raw[NUM_SAMPLE_PA] = {0};
@@ -1609,6 +1647,9 @@ void dwinDataRefreshTask(void *pvParameters) {
     // -------- DS3231: Time --------
     if(rtcInit){
       rtc.refresh();
+      float tempC = rtc.temp();
+      tempC /= 100;
+      Serial.println("[RTC] Temperature: " + String(tempC, 2) + " °C");
       refreshRTC();
     }
 
